@@ -43,6 +43,7 @@ func ScaleOut(rdsClient *rds.RDS, rdsClusterName string, readerNamePrefix string
 		MultiAZ:                 writerInstance.MultiAZ,
 		CopyTagsToSnapshot:      writerInstance.CopyTagsToSnapshot,
 		AutoMinorVersionUpgrade: writerInstance.AutoMinorVersionUpgrade,
+		DBParameterGroupName:    writerInstance.DBParameterGroups[0].DBParameterGroupName,
 	}
 
 	// Perform the scaling operation to add a reader to the cluster
