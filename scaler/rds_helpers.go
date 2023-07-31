@@ -5,39 +5,46 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/rds"
 	"math/rand"
-	"strings"
 )
 
-func getCurrentWriterInstance(rdsClient *rds.RDS, rdsClusterName string) (*rds.DBInstance, error) {
-	describeInput := &rds.DescribeDBInstancesInput{
-		Filters: []*rds.Filter{
-			{
-				Name:   aws.String("db-cluster-id"),
-				Values: []*string{aws.String(rdsClusterName)},
-			},
-		},
+func GetCurrentWriterInstance(rdsClient *rds.RDS, rdsClusterName string) (*rds.DBInstance, error) {
+	describeInput := &rds.DescribeDBClustersInput{
+		DBClusterIdentifier: aws.String(rdsClusterName),
 	}
 
-	describeOutput, err := rdsClient.DescribeDBInstances(describeInput)
+	clusterOutput, err := rdsClient.DescribeDBClusters(describeInput)
 	if err != nil {
-		return nil, fmt.Errorf("failed to describe RDS instances: %v", err)
+		return nil, err
 	}
 
-	if len(describeOutput.DBInstances) == 0 {
-		return nil, fmt.Errorf("no matching RDS cluster found: %s", rdsClusterName)
+	if len(clusterOutput.DBClusters) == 0 {
+		return nil, fmt.Errorf("aurora cluster not found: %s", rdsClusterName)
 	}
 
-	// Find the writer instance in the cluster members
-	for _, instance := range describeOutput.DBInstances {
-		if aws.StringValue(instance.DBClusterIdentifier) == rdsClusterName {
-			return instance, nil
+	// Loop through the cluster members to find the writer instance
+	for _, member := range clusterOutput.DBClusters[0].DBClusterMembers {
+		if aws.BoolValue(member.IsClusterWriter) {
+			describeInstanceInput := &rds.DescribeDBInstancesInput{
+				DBInstanceIdentifier: member.DBInstanceIdentifier,
+			}
+
+			instanceOutput, err := rdsClient.DescribeDBInstances(describeInstanceInput)
+			if err != nil {
+				return nil, err
+			}
+
+			if len(instanceOutput.DBInstances) > 0 {
+				return instanceOutput.DBInstances[0], nil
+			}
+
+			return nil, fmt.Errorf("Writer instance not found in cluster: %s", rdsClusterName)
 		}
 	}
 
-	return nil, fmt.Errorf("writer instance not found in the RDS cluster")
+	return nil, fmt.Errorf("Writer instance not found in cluster: %s", rdsClusterName)
 }
 
-func hasRunningReaderForHour(rdsClient *rds.RDS, rdsClusterName string, readerNamePrefix string, hour int) (bool, error) {
+func GetReaderInstances(rdsClient *rds.RDS, rdsClusterName string) []*rds.DBInstance {
 	describeInput := &rds.DescribeDBInstancesInput{
 		Filters: []*rds.Filter{
 			{
@@ -49,23 +56,24 @@ func hasRunningReaderForHour(rdsClient *rds.RDS, rdsClusterName string, readerNa
 
 	describeOutput, err := rdsClient.DescribeDBInstances(describeInput)
 	if err != nil {
-		return false, fmt.Errorf("failed to describe RDS instances: %v", err)
+		fmt.Println("Error describing RDS instances:", err)
+		return nil
 	}
 
-	// Check if any reader instance with the desired name prefix exists for the current scale-out hour
+	writerInstance, err := GetCurrentWriterInstance(rdsClient, rdsClusterName)
+	if err != nil {
+		fmt.Println("Error describing RDS writer instance:", err)
+		return nil
+	}
+
+	readerInstances := make([]*rds.DBInstance, 0)
 	for _, instance := range describeOutput.DBInstances {
-		if strings.HasPrefix(*instance.DBInstanceIdentifier, fmt.Sprintf("%s%d-", readerNamePrefix, hour)) {
-			// Check if the instance is in one of the running statuses
-			runningStatuses := []string{"available", "backing-up", "creating"}
-			for _, status := range runningStatuses {
-				if *instance.DBInstanceStatus == status {
-					return true, nil
-				}
-			}
+		if aws.StringValue(writerInstance.DBInstanceIdentifier) != aws.StringValue(instance.DBInstanceIdentifier) {
+			readerInstances = append(readerInstances, instance)
 		}
 	}
 
-	return false, nil
+	return readerInstances
 }
 
 func generateRandomUID() string {
