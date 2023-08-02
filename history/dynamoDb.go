@@ -36,12 +36,12 @@ func New(dynamoDB dynamodbiface.DynamoDBAPI, name string) (*DynamoDBHistory, err
 	}, nil
 }
 
-func (h *DynamoDBHistory) SaveItem(timestamp string, numReaders uint, maxCpuUtilization float64) error {
+func (h *DynamoDBHistory) SaveItem(numReaders uint, maxCpuUtilization float64) error {
 	// Calculate the TTL value (8 days from the current timestamp)
 	ttl := time.Now().Add(8 * 24 * time.Hour).Unix()
 
 	item := Item{
-		Timestamp:         timestamp,
+		Timestamp:         time.Now().Truncate(10 * time.Second).Format(time.RFC3339),
 		ClusterName:       h.clusterName,
 		NumReaders:        numReaders,
 		MaxCpuUtilization: maxCpuUtilization,
@@ -66,9 +66,9 @@ func (h *DynamoDBHistory) SaveItem(timestamp string, numReaders uint, maxCpuUtil
 	return nil
 }
 
-func (h *DynamoDBHistory) GetMaxCpuUtilization(lookupTime time.Time) (float64, error) {
+func (h *DynamoDBHistory) GetHistoricValue(lookupTime time.Time) (float64, uint, error) {
 	// Convert to DynamoDB timestamp format (RFC3339)
-	timeString := lookupTime.Format(time.RFC3339)
+	timeString := lookupTime.Truncate(10 * time.Second).Format(time.RFC3339)
 
 	input := &dynamodb.QueryInput{
 		TableName:              aws.String(tableName),
@@ -90,20 +90,20 @@ func (h *DynamoDBHistory) GetMaxCpuUtilization(lookupTime time.Time) (float64, e
 
 	result, err := h.dynamoDB.Query(input)
 	if err != nil {
-		return 0, fmt.Errorf("failed to query DynamoDB: %v", err)
+		return 0, 0, fmt.Errorf("failed to query DynamoDB: %v", err)
 	}
 
 	if len(result.Items) > 0 {
 		item := Item{}
 		err := dynamodbattribute.UnmarshalMap(result.Items[0], &item)
 		if err != nil {
-			return 0, fmt.Errorf("failed to unmarshal DynamoDB item: %v", err)
+			return 0, 0, fmt.Errorf("failed to unmarshal DynamoDB item: %v", err)
 		}
-		return item.MaxCpuUtilization, nil
+		return item.MaxCpuUtilization, item.NumReaders, nil
 	}
 
 	// No value found for the last week, return 0
-	return 0, nil
+	return 0, 0, nil
 }
 
 func createTableIfNotExists(dynamoDB dynamodbiface.DynamoDBAPI) error {
