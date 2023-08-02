@@ -1,48 +1,42 @@
 package history
 
 import (
+	"context"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
 	"time"
 )
 
 const tableName = "predictive-autoscaling-history"
 
-type Item struct {
-	Timestamp         string  `json:"timestamp"`
-	NumReaders        uint    `json:"num_readers"`
-	MaxCpuUtilization float64 `json:"max_cpu_utilization"`
-	ClusterName       string  `json:"cluster_name"`
-	TTL               int64   `json:"ttl"`
-}
+func New(ctx context.Context, awsSession *session.Session, awsRegion string, name string) (*History, error) {
 
-type DynamoDBHistory struct {
-	dynamoDB    dynamodbiface.DynamoDBAPI
-	clusterName string
-}
+	dynamoDbClient := dynamodb.New(awsSession, &aws.Config{
+		Region: aws.String(awsRegion),
+	})
 
-func New(dynamoDB dynamodbiface.DynamoDBAPI, name string) (*DynamoDBHistory, error) {
 	// Check if the table exists and create if not
-	if err := createTableIfNotExists(dynamoDB); err != nil {
+	if err := createTableIfNotExists(ctx, dynamoDbClient); err != nil {
 		return nil, err
 	}
 
-	return &DynamoDBHistory{
-		dynamoDB:    dynamoDB,
+	return &History{
+		client:      dynamoDbClient,
 		clusterName: name,
+		context:     ctx,
 	}, nil
 }
 
-func (h *DynamoDBHistory) SaveItem(numReaders uint, maxCpuUtilization float64) error {
+func (instance *History) SaveItem(numReaders uint, maxCpuUtilization float64) error {
 	// Calculate the TTL value (8 days from the current timestamp)
 	ttl := time.Now().Add(8 * 24 * time.Hour).Unix()
 
 	item := Item{
 		Timestamp:         time.Now().Truncate(10 * time.Second).Format(time.RFC3339),
-		ClusterName:       h.clusterName,
+		ClusterName:       instance.clusterName,
 		NumReaders:        numReaders,
 		MaxCpuUtilization: maxCpuUtilization,
 		TTL:               ttl,
@@ -58,7 +52,7 @@ func (h *DynamoDBHistory) SaveItem(numReaders uint, maxCpuUtilization float64) e
 		Item:      av,
 	}
 
-	_, err = h.dynamoDB.PutItem(input)
+	_, err = instance.client.PutItemWithContext(instance.context, input) // Pass the context here
 	if err != nil {
 		return fmt.Errorf("failed to put item into DynamoDB: %v", err)
 	}
@@ -66,7 +60,7 @@ func (h *DynamoDBHistory) SaveItem(numReaders uint, maxCpuUtilization float64) e
 	return nil
 }
 
-func (h *DynamoDBHistory) GetHistoricValue(lookupTime time.Time) (float64, uint, error) {
+func (instance *History) GetValue(lookupTime time.Time) (float64, uint, error) {
 	// Convert to DynamoDB timestamp format (RFC3339)
 	timeString := lookupTime.Truncate(10 * time.Second).Format(time.RFC3339)
 
@@ -78,7 +72,7 @@ func (h *DynamoDBHistory) GetHistoricValue(lookupTime time.Time) (float64, uint,
 		},
 		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
 			":name": {
-				S: aws.String(h.clusterName),
+				S: aws.String(instance.clusterName),
 			},
 			":ts": {
 				S: aws.String(timeString),
@@ -88,7 +82,7 @@ func (h *DynamoDBHistory) GetHistoricValue(lookupTime time.Time) (float64, uint,
 		Limit:            aws.Int64(1),    // Fetch only the newest item
 	}
 
-	result, err := h.dynamoDB.Query(input)
+	result, err := instance.client.QueryWithContext(instance.context, input) // Pass the context here
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to query DynamoDB: %v", err)
 	}
@@ -106,11 +100,11 @@ func (h *DynamoDBHistory) GetHistoricValue(lookupTime time.Time) (float64, uint,
 	return 0, 0, nil
 }
 
-func createTableIfNotExists(dynamoDB dynamodbiface.DynamoDBAPI) error {
+func createTableIfNotExists(ctx context.Context, client *dynamodb.DynamoDB) error {
 	tableName := aws.String(tableName)
 
 	// Check if the table exists
-	existingTables, err := dynamoDB.ListTables(&dynamodb.ListTablesInput{})
+	existingTables, err := client.ListTablesWithContext(ctx, &dynamodb.ListTablesInput{})
 	if err != nil {
 		return fmt.Errorf("failed to list DynamoDB tables: %v", err)
 	}
@@ -157,7 +151,7 @@ func createTableIfNotExists(dynamoDB dynamodbiface.DynamoDBAPI) error {
 			TableName: tableName,
 		}
 
-		_, err = dynamoDB.CreateTable(input)
+		_, err = client.CreateTableWithContext(ctx, input) // Pass the context here
 		if err != nil {
 			return fmt.Errorf("failed to create DynamoDB table: %v", err)
 		}
@@ -167,7 +161,7 @@ func createTableIfNotExists(dynamoDB dynamodbiface.DynamoDBAPI) error {
 		waitInput := &dynamodb.DescribeTableInput{
 			TableName: tableName,
 		}
-		err = dynamoDB.WaitUntilTableExists(waitInput)
+		err = client.WaitUntilTableExistsWithContext(ctx, waitInput) // Pass the context here
 		if err != nil {
 			return fmt.Errorf("failed to wait for table creation: %v", err)
 		}
@@ -184,7 +178,7 @@ func createTableIfNotExists(dynamoDB dynamodbiface.DynamoDBAPI) error {
 			},
 		}
 
-		_, err = dynamoDB.UpdateTimeToLive(ttlInput)
+		_, err = client.UpdateTimeToLiveWithContext(ctx, ttlInput) // Pass the context here
 		if err != nil {
 			return fmt.Errorf("failed to enable TTL for the table: %v", err)
 		}

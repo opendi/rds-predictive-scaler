@@ -8,19 +8,19 @@ import (
 	"time"
 )
 
-var scalerConfig scaler.ScalerConfig
+var config scaler.Config
 
 func init() {
-	flag.UintVar(&scalerConfig.ScaleInStep, "scaleInStep", 1, "Number of reader instances to scale in at a time")
-	flag.UintVar(&scalerConfig.ScaleOutStep, "scaleOutStep", 1, "Number of reader instances to scale out at a time")
-	flag.UintVar(&scalerConfig.MinInstances, "minInstances", 2, "Minimum number of readers required in the cluster")
-	flag.UintVar(&scalerConfig.MaxInstances, "maxInstances", 5, "Maximum number of readers allowed in the cluster")
-	flag.StringVar(&scalerConfig.AwsRegion, "awsRegion", "", "AWS region")
-	flag.StringVar(&scalerConfig.BoostHours, "boostHours", "", "Comma-separated list of hours to boost minInstances")
-	flag.StringVar(&scalerConfig.RdsClusterName, "rdsClusterName", "", "RDS cluster name")
-	flag.Float64Var(&scalerConfig.TargetCpuUtil, "targetCpuUtilization", 70.0, "Target CPU utilization percentage")
-	flag.DurationVar(&scalerConfig.ScaleOutCooldown, "scaleOutCooldown", 10*time.Minute, "Cooldown time after scaling actions to avoid constant scale up/down activity")
-	flag.DurationVar(&scalerConfig.ScaleInCooldown, "scaleInCooldown", 5*time.Minute, "Cooldown time after scaling actions to avoid constant scale up/down activity")
+	flag.UintVar(&config.ScaleInStep, "scaleInStep", 1, "Number of reader instances to scale in at a time")
+	flag.UintVar(&config.ScaleOutStep, "scaleOutStep", 1, "Number of reader instances to scale out at a time")
+	flag.UintVar(&config.MinInstances, "minInstances", 2, "Minimum number of readers required in the cluster")
+	flag.UintVar(&config.MaxInstances, "maxInstances", 5, "Maximum number of readers allowed in the cluster")
+	flag.StringVar(&config.AwsRegion, "awsRegion", "", "AWS region")
+	flag.StringVar(&config.BoostHours, "boostHours", "", "Comma-separated list of hours to boost minInstances")
+	flag.StringVar(&config.RdsClusterName, "rdsClusterName", "", "RDS cluster name")
+	flag.Float64Var(&config.TargetCpuUtil, "targetCpuUtilization", 70.0, "Target CPU utilization percentage")
+	flag.DurationVar(&config.ScaleOutCooldown, "scaleOutCooldown", 10*time.Minute, "Cooldown time after scaling actions to avoid constant scale up/down activity")
+	flag.DurationVar(&config.ScaleInCooldown, "scaleInCooldown", 5*time.Minute, "Cooldown time after scaling actions to avoid constant scale up/down activity")
 
 	flag.Parse()
 }
@@ -33,10 +33,10 @@ func main() {
 		log.Fatal("Failed to create AWS session:", err)
 	}
 
-	err = scaler.Init(awsSession, scalerConfig)
+	rdsScaler, err := scaler.New(config, awsSession)
 	if err != nil {
-		log.Fatal("Failed to initialize scaler:", err)
+		log.Fatal("Failed to create scaler:", err)
 	}
 
-	scaler.Run()
+	rdsScaler.Run()
 }

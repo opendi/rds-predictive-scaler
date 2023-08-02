@@ -3,11 +3,10 @@ package scaler
 import (
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 )
 
-func IsScaleOutHour(hour int, scaleOutHours []int) bool {
+func isBoostHour(hour int, scaleOutHours []int) bool {
 	for _, h := range scaleOutHours {
 		if hour == h {
 			return true
@@ -16,7 +15,11 @@ func IsScaleOutHour(hour int, scaleOutHours []int) bool {
 	return false
 }
 
-func ParseScaleOutHours(scaleOutHoursStr string) ([]int, error) {
+func parseBoostHours(scaleOutHoursStr string) ([]int, error) {
+	if scaleOutHoursStr == "" {
+		return nil, nil // Return nil to indicate no boost hours specified
+	}
+
 	hoursStr := splitAndTrimStrings(scaleOutHoursStr, ",")
 	scaleOutHours := make([]int, 0, len(hoursStr))
 	for _, hourStr := range hoursStr {
@@ -27,14 +30,6 @@ func ParseScaleOutHours(scaleOutHoursStr string) ([]int, error) {
 		scaleOutHours = append(scaleOutHours, hour)
 	}
 	return scaleOutHours, nil
-}
-
-func splitAndTrimStrings(input, sep string) []string {
-	items := strings.Split(input, sep)
-	for i, item := range items {
-		items[i] = strings.TrimSpace(item)
-	}
-	return items
 }
 
 func CalculateRemainingCooldown(cooldown time.Duration, lastScaleTime time.Time) int {
