@@ -7,11 +7,13 @@ import (
 	"time"
 )
 
-func ScaleOut(rdsClient *rds.RDS, rdsClusterName string, readerNamePrefix string, numInstances int) error {
+func ScaleOut(rdsClient *rds.RDS, rdsClusterName string, readerNamePrefix string, numInstances uint) error {
 	currentHour := time.Now().Hour()
-	for i := 0; i < numInstances; i++ {
+	newReaderInstanceNames := make([]string, numInstances)
+
+	for i := 0; i < int(numInstances); i++ {
 		// Get the current writer instance
-		writerInstance, err := GetCurrentWriterInstance(rdsClient, rdsClusterName)
+		writerInstance, err := GetWriterInstance(rdsClient, rdsClusterName)
 		if err != nil {
 			return fmt.Errorf("failed to get current writer instance: %v", err)
 		}
@@ -42,14 +44,26 @@ func ScaleOut(rdsClient *rds.RDS, rdsClusterName string, readerNamePrefix string
 		}
 
 		fmt.Printf("Scaling out operation successful. New reader instance name: %s\n", readerName)
+
+		// Add the new reader instance name to the slice
+		newReaderInstanceNames[i] = readerName
 	}
+
+	// Wait for all new reader instances to become "Available"
+	fmt.Printf("Waiting for all new reader instances to become 'Available'...\n")
+	err := waitForInstancesAvailable(rdsClient, newReaderInstanceNames)
+	if err != nil {
+		return fmt.Errorf("failed to wait for the new reader instances to become 'Available': %v", err)
+	}
+
+	fmt.Printf("All new reader instances are now 'Available'. Continuing...\n")
 	return nil
 }
 
-func ScaleIn(rdsClient *rds.RDS, rdsClusterName string, numInstances int) error {
-	readerInstances := GetReaderInstances(rdsClient, rdsClusterName)
+func ScaleIn(rdsClient *rds.RDS, rdsClusterName string, numInstances uint) error {
+	readerInstances, _ := GetReaderInstances(rdsClient, rdsClusterName, StatusAll)
 
-	for i := 0; i < numInstances; i++ {
+	for i := 0; i < int(numInstances); i++ {
 		// Check if there are any reader instances available to scale in
 		if len(readerInstances) == 0 {
 			break
@@ -58,7 +72,7 @@ func ScaleIn(rdsClient *rds.RDS, rdsClusterName string, numInstances int) error 
 		// Choose a reader instance to remove
 		instance := readerInstances[0]
 
-		// Check if the instance is in the process of deletion and it's the last remaining reader instance
+		// Check if the instance is in the process of deletion, and it's the last remaining reader instance
 		if *instance.DBInstanceStatus == "deleting" && len(readerInstances) == 1 {
 			fmt.Printf("The last remaining instance %s is already in status 'deleting'. Will not remove it to avoid service disruption.\n", *instance.DBInstanceIdentifier)
 			break
@@ -119,7 +133,7 @@ func waitUntilInstanceDeletable(rdsClient *rds.RDS, instanceIdentifier string) e
 		}
 
 		fmt.Printf("Waiting for instance %s to become deletable (current status: %s)...\n", instanceIdentifier, instanceStatus)
-		time.Sleep(30 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
 }
 
@@ -129,27 +143,43 @@ func isDeletableStatus(status string) bool {
 }
 
 // ShouldScaleOut returns true if scaling out is needed based on the current CPU utilization and the maximum number of instances.
-func ShouldScaleOut(cpuUtilization, targetCpuUtil float64, currentSize, maxInstances int) bool {
-	return cpuUtilization >= targetCpuUtil && maxInstances <= currentSize
+func ShouldScaleOut(cpuUtilization, targetCpuUtil float64, currentSize, minInstances, maxInstances uint) bool {
+	return currentSize < minInstances || (cpuUtilization > targetCpuUtil && currentSize < maxInstances)
 }
 
 // CalculateScaleOutInstances calculates the number of instances to scale out based on the maximum number of instances and the current size.
-func CalculateScaleOutInstances(maxInstances, currentSize, scaleOutStep int) int {
+func CalculateScaleOutInstances(maxInstances, currentSize, scaleOutStep uint) uint {
 	return minInt(scaleOutStep, maxInstances-currentSize)
 }
 
 // ShouldScaleIn returns true if scaling in is needed based on the current CPU utilization and the minimum number of instances.
-func ShouldScaleIn(cpuUtilization float64, targetCpuUtil float64, currentSize, minInstances int) bool {
-	return cpuUtilization < targetCpuUtil && currentSize > minInstances
+func ShouldScaleIn(cpuUtilization float64, targetCpuUtil float64, currentSize, scaleInStep uint, minInstances uint) bool {
+	if currentSize < minInstances+scaleInStep {
+		fmt.Println("Scaling in not allowed, minimum instance threshold reached.")
+		return false
+	}
+
+	if cpuUtilization < 50 && (currentSize-scaleInStep) <= 0 {
+		fmt.Println("Scaling in required, CPU utilization is below 50% and would result in 0 instances.")
+		return true
+	}
+
+	if cpuUtilization*(float64(currentSize)/float64(currentSize-scaleInStep)) <= targetCpuUtil {
+		fmt.Println("Scaling in required, current load after scaling down is below the target CPU utilization.")
+		return true
+	}
+
+	fmt.Println("No need to scale in.")
+	return false
 }
 
 // CalculateScaleInInstances calculates the number of instances to scale in based on the current size and the minimum number of instances.
-func CalculateScaleInInstances(currentSize, minInstances, scaleInStep int) int {
+func CalculateScaleInInstances(currentSize, minInstances, scaleInStep uint) uint {
 	return minInt(scaleInStep, currentSize-minInstances)
 }
 
 // Helper function to return the minimum of two integers
-func minInt(a, b int) int {
+func minInt(a, b uint) uint {
 	if a < b {
 		return a
 	}
