@@ -11,14 +11,14 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v1
 
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@v2.5.0
 
       - name: Login to Docker Hub
         run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
@@ -28,5 +28,5 @@ jobs:
           docker buildx build \
             --file Dockerfile \
             --platform linux/amd64,linux/arm64,linux/arm/v7 \
-            --tag opendi/predictive-rds-scaler:${{ github.ref }} \
+            --tag opendi/predictive-rds-scaler:${{ github.ref_name }} \
             --push .
