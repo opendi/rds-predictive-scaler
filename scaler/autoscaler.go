@@ -91,7 +91,7 @@ func (s *Scaler) Run() {
 			} else {
 				fmt.Println("Max instances reached. Cannot scale out.")
 			}
-		}
+		} else
 
 		// Scale in if needed
 		if !s.scaleIn.InCooldown && !s.scaleOut.InCooldown && ShouldScaleIn(cpuUtilization, s.config.TargetCpuUtil, currentSize, s.config.ScaleInStep, s.config.MinInstances) {
@@ -284,7 +284,19 @@ func isDeletableStatus(status string) bool {
 
 // ShouldScaleOut returns true if scaling out is needed based on the current CPU utilization and the maximum number of instances.
 func ShouldScaleOut(cpuUtilization, targetCpuUtil float64, currentSize, minInstances, maxInstances uint) bool {
-	return currentSize < minInstances || (cpuUtilization > targetCpuUtil && currentSize < maxInstances)
+	if currentSize < minInstances {
+		fmt.Println("Scaler: Should scale out, currently below minimum instances.")
+		fmt.Printf("Scaler: Actual: %d, Desired: %d\n", currentSize, minInstances)
+		return true
+	}
+
+	if cpuUtilization > targetCpuUtil && currentSize < maxInstances {
+		fmt.Printf("Scaler: Should scale out, currently above target CPU utilization. %.2f\n", cpuUtilization)
+		return true
+	}
+
+	fmt.Println("Scaler: No need to scale out")
+	return false
 }
 
 // CalculateScaleOutInstances calculates the number of instances to scale out based on the maximum number of instances and the current size.
@@ -294,22 +306,27 @@ func CalculateScaleOutInstances(maxInstances, currentSize, scaleOutStep uint) ui
 
 // ShouldScaleIn returns true if scaling in is needed based on the current CPU utilization and the minimum number of instances.
 func ShouldScaleIn(cpuUtilization float64, targetCpuUtil float64, currentSize, scaleInStep uint, minInstances uint) bool {
-	if currentSize < minInstances+scaleInStep {
-		fmt.Println("Scaling in not allowed, minimum instance threshold reached.")
+	if cpuUtilization > targetCpuUtil {
 		return false
 	}
 
-	if cpuUtilization < 50 && (currentSize-scaleInStep) <= 0 {
-		fmt.Println("Scaling in required, CPU utilization is below 50% and would result in 0 instances.")
+	if currentSize < minInstances+scaleInStep {
+		fmt.Println("Scaler: Skipping scaling in: Minimum instance threshold reached.")
+		return false
+	}
+
+	if cpuUtilization <= 50 && (currentSize-scaleInStep) == 0 {
+		fmt.Println("Scaler: Should scale in, CPU utilization is below 50%, scaling in to 0 instances.")
 		return true
 	}
 
-	if cpuUtilization*(float64(currentSize)/float64(currentSize-scaleInStep)) <= targetCpuUtil {
-		fmt.Println("Scaling in required, current load after scaling down is below the target CPU utilization.")
+	predictedCpuUtilization := (cpuUtilization / float64(currentSize)) * float64(currentSize-scaleInStep)
+	if predictedCpuUtilization <= targetCpuUtil {
+		fmt.Printf("Scaler: Should scale in, predicted CPU utilization %.2f is below target.\n", predictedCpuUtilization)
 		return true
 	}
 
-	fmt.Println("No need to scale in.")
+	fmt.Println("Scaler: No need to scale in.")
 	return false
 }
 
