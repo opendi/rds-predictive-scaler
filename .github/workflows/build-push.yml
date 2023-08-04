@@ -1,0 +1,32 @@
+name: Build and Push Multi-Arch Docker Image
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  buildx:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Build and Push Docker Image
+        run: |
+          docker buildx build \
+            --file Dockerfile \
+            --platform linux/amd64,linux/arm64,linux/arm/v7 \
+            --tag opendi/predictive-rds-scaler:${{ github.ref }} \
+            --push .
