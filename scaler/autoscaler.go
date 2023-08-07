@@ -7,13 +7,14 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudwatch"
 	"github.com/aws/aws-sdk-go/service/rds"
+	"github.com/rs/zerolog"
 	"predictive-rds-scaler/history"
 	"time"
 )
 
 const readerNamePrefix = "predictive-autoscaling-"
 
-func New(config Config, awsSession *session.Session) (*Scaler, error) {
+func New(config Config, logger *zerolog.Logger, awsSession *session.Session) (*Scaler, error) {
 	rdsClient := rds.New(awsSession, &aws.Config{
 		Region: aws.String(config.AwsRegion),
 	})
@@ -23,18 +24,19 @@ func New(config Config, awsSession *session.Session) (*Scaler, error) {
 	})
 
 	ctx := context.Background()
-	var dynamoDbHistory, err = history.New(ctx, awsSession, config.AwsRegion, config.RdsClusterName)
+	dynamoDbHistory, err := history.New(ctx, logger, awsSession, config.AwsRegion, config.RdsClusterName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create DynamoDB history: %v", err)
 	}
 
 	return &Scaler{
 		config:           config,
-		scaleOut:         Cooldown{},
-		scaleIn:          Cooldown{},
+		scaleOutStatus:   Cooldown{},
+		scaleInStatus:    Cooldown{},
 		rdsClient:        rdsClient,
 		cloudWatchClient: cloudWatchClient,
 		dynamoDbHistory:  dynamoDbHistory,
+		logger:           logger,
 	}, nil
 }
 
@@ -42,24 +44,24 @@ func (s *Scaler) Run() {
 	ticker := time.NewTicker(10 * time.Second)
 	boostHours, err := parseBoostHours(s.config.BoostHours)
 	if err != nil {
-		fmt.Println("Error parsing scale out hours:", err)
+		s.logger.Error().Err(err).Msg("Error parsing scale out hours")
 		return
 	}
 
 	for range ticker.C {
-		writerInstance, err := getWriterInstance(s.rdsClient, s.config.RdsClusterName)
+		writerInstance, err := s.getWriterInstance()
 		if err != nil {
-			fmt.Println("Error getting writer instance:", err)
+			s.logger.Error().Err(err).Msg("Error getting writer instance")
 			continue
 		}
-		readerInstances, currentSize, err := getReaderInstances(s.rdsClient, s.config.RdsClusterName, StatusAll^StatusDeleting)
+		readerInstances, currentSize, err := s.getReaderInstances(StatusAll ^ StatusDeleting)
 		if err != nil {
-			fmt.Println("Error getting reader instances:", err)
+			s.logger.Error().Err(err).Msg("Error getting reader instances")
 			continue
 		}
 		cpuUtilization, err := s.getUtilization(readerInstances, writerInstance)
 		if err != nil {
-			fmt.Println("Error getting CPU utilization:", err)
+			s.logger.Error().Err(err).Msg("Error getting CPU utilization")
 			continue
 		}
 
@@ -68,48 +70,46 @@ func (s *Scaler) Run() {
 			minInstances = s.config.MinInstances + s.config.ScaleOutStep
 		}
 
-		fmt.Printf("Current CPU Utilization: %.2f%%, %d readers, in ScaleOut-Cooldown: %d, in ScaleIn-Cooldown: %d\n",
-			cpuUtilization,
-			currentSize,
-			CalculateRemainingCooldown(s.config.ScaleOutCooldown, s.scaleOut.LastTime),
-			CalculateRemainingCooldown(s.config.ScaleInCooldown, s.scaleIn.LastTime))
+		s.logger.Info().
+			Float64("CPUUtilization", cpuUtilization).
+			Uint("CurrentReaders", currentSize).
+			Dur("ScaleOutCooldownRemaining", calculateRemainingCooldown(s.config.ScaleOutCooldown, s.scaleOutStatus.LastTime)).
+			Dur("ScaleInCooldownRemaining", calculateRemainingCooldown(s.config.ScaleInCooldown, s.scaleInStatus.LastTime)).
+			Msg("Scaler status")
 
-		if !s.scaleOut.InCooldown && ShouldScaleOut(cpuUtilization, s.config.TargetCpuUtil, currentSize, minInstances, s.config.MaxInstances) {
-			scaleOutInstances := CalculateScaleOutInstances(s.config.MaxInstances, currentSize, s.config.ScaleOutStep)
+		if !s.scaleOutStatus.InCooldown && s.shouldScaleOut(cpuUtilization, currentSize, minInstances) {
+			scaleOutInstances := s.calculateScaleOutReaderCount(currentSize)
 			if scaleOutInstances > 0 {
-				fmt.Printf("Scaling out by %d instances\n", scaleOutInstances)
-				err := ScaleOut(s.rdsClient, s.config.RdsClusterName, readerNamePrefix, scaleOutInstances)
+				s.logger.Info().Uint("ScaleOutInstances", scaleOutInstances).Msg("Scaling out instances")
+				err := s.scaleOut(readerNamePrefix, scaleOutInstances)
 				if err != nil {
-					fmt.Println("Error scaling out:", err)
+					s.logger.Error().Err(err).Msg("Error scaling out")
 				} else {
-					s.scaleOut.InCooldown = true
-					s.scaleOut.LastTime = time.Now()
+					s.scaleOutStatus.InCooldown = true
+					s.scaleOutStatus.LastTime = time.Now()
 					time.AfterFunc(s.config.ScaleOutCooldown, func() {
-						s.scaleOut.InCooldown = false
+						s.scaleOutStatus.InCooldown = false
 					})
 				}
 			} else {
-				fmt.Println("Max instances reached. Cannot scale out.")
+				s.logger.Info().Msg("Max instances reached. Cannot scale out.")
 			}
-		} else
-
-		// Scale in if needed
-		if !s.scaleIn.InCooldown && !s.scaleOut.InCooldown && ShouldScaleIn(cpuUtilization, s.config.TargetCpuUtil, currentSize, s.config.ScaleInStep, s.config.MinInstances) {
-			scaleInInstances := CalculateScaleInInstances(currentSize, s.config.MinInstances, s.config.ScaleInStep)
+		} else if !s.scaleInStatus.InCooldown && !s.scaleOutStatus.InCooldown && s.shouldScaleIn(cpuUtilization, currentSize, minInstances) {
+			scaleInInstances := s.calculateScaleInReaderCount(currentSize, minInstances)
 			if scaleInInstances > 0 {
-				fmt.Printf("Scaling in by %d instances\n", scaleInInstances)
-				err := ScaleIn(s.rdsClient, s.config.RdsClusterName, scaleInInstances)
+				s.logger.Info().Uint("ScaleInInstances", scaleInInstances).Msg("Scaling in instances")
+				err := s.scaleIn(scaleInInstances)
 				if err != nil {
-					fmt.Println("Error scaling in:", err)
+					s.logger.Error().Err(err).Msg("Error scaling in")
 				} else {
-					s.scaleIn.InCooldown = true
-					s.scaleIn.LastTime = time.Now()
+					s.scaleInStatus.InCooldown = true
+					s.scaleInStatus.LastTime = time.Now()
 					time.AfterFunc(s.config.ScaleInCooldown, func() {
-						s.scaleIn.InCooldown = false
+						s.scaleInStatus.InCooldown = false
 					})
 				}
 			} else {
-				fmt.Println("Min instances reached. Cannot scale in.")
+				s.logger.Info().Msg("Min instances reached. Cannot scale in.")
 			}
 		}
 	}
@@ -122,7 +122,7 @@ func (s *Scaler) getUtilization(readerInstances []*rds.DBInstance, writerInstanc
 		return 0, fmt.Errorf("error getting historic value: %v", err)
 	}
 
-	currentCpuUtilization, currentActiveReaderCount, err := GetMaxCPUUtilization(readerInstances, writerInstance, s.cloudWatchClient)
+	currentCpuUtilization, currentActiveReaderCount, err := s.getMaxCPUUtilization(readerInstances, writerInstance)
 	if err != nil {
 		return 0, fmt.Errorf("error getting max CPU utilization: %v", err)
 	}
@@ -144,13 +144,13 @@ func (s *Scaler) getUtilization(readerInstances []*rds.DBInstance, writerInstanc
 	return currentCpuUtilization, nil
 }
 
-func ScaleOut(rdsClient *rds.RDS, rdsClusterName string, readerNamePrefix string, numInstances uint) error {
+func (s *Scaler) scaleOut(readerNamePrefix string, numInstances uint) error {
 	currentHour := time.Now().Hour()
 	newReaderInstanceNames := make([]string, numInstances)
 
 	for i := 0; i < int(numInstances); i++ {
 		// Get the current writer instance
-		writerInstance, err := getWriterInstance(rdsClient, rdsClusterName)
+		writerInstance, err := s.getWriterInstance()
 		if err != nil {
 			return fmt.Errorf("failed to get current writer instance: %v", err)
 		}
@@ -165,7 +165,7 @@ func ScaleOut(rdsClient *rds.RDS, rdsClusterName string, readerNamePrefix string
 		readerDBInstance := &rds.CreateDBInstanceInput{
 			DBInstanceClass:         writerInstance.DBInstanceClass,
 			Engine:                  writerInstance.Engine,
-			DBClusterIdentifier:     aws.String(rdsClusterName),
+			DBClusterIdentifier:     aws.String(s.config.RdsClusterName),
 			DBInstanceIdentifier:    aws.String(readerName),
 			PubliclyAccessible:      aws.Bool(false),
 			MultiAZ:                 writerInstance.MultiAZ,
@@ -175,30 +175,30 @@ func ScaleOut(rdsClient *rds.RDS, rdsClusterName string, readerNamePrefix string
 		}
 
 		// Perform the scaling operation to add a reader to the cluster
-		_, err = rdsClient.CreateDBInstance(readerDBInstance)
+		_, err = s.rdsClient.CreateDBInstance(readerDBInstance)
 		if err != nil {
 			return fmt.Errorf("failed to add reader instance: %v", err)
 		}
 
-		fmt.Printf("Scaling out operation successful. New reader instance name: %s\n", readerName)
+		s.logger.Info().Str("NewReaderInstanceName", readerName).Msg("Scaling out operation successful")
 
 		// Add the new reader instance name to the slice
 		newReaderInstanceNames[i] = readerName
 	}
 
 	// Wait for all new reader instances to become "Available"
-	fmt.Printf("Waiting for all new reader instances to become 'Available'...\n")
-	err := waitForInstancesAvailable(rdsClient, newReaderInstanceNames)
+	s.logger.Info().Msg("Waiting for all new reader instances to become 'Available'...")
+	err := s.waitForInstancesAvailable(newReaderInstanceNames)
 	if err != nil {
 		return fmt.Errorf("failed to wait for the new reader instances to become 'Available': %v", err)
 	}
 
-	fmt.Printf("All new reader instances are now 'Available'. Continuing...\n")
+	s.logger.Info().Msg("All new reader instances are now 'Available'. Continuing...")
 	return nil
 }
 
-func ScaleIn(rdsClient *rds.RDS, rdsClusterName string, numInstances uint) error {
-	readerInstances, _, err := getReaderInstances(rdsClient, rdsClusterName, StatusAll)
+func (s *Scaler) scaleIn(numInstances uint) error {
+	readerInstances, _, err := s.getReaderInstances(StatusAll)
 	if err != nil {
 		return fmt.Errorf("failed to get reader instances: %v", err)
 	}
@@ -214,27 +214,27 @@ func ScaleIn(rdsClient *rds.RDS, rdsClusterName string, numInstances uint) error
 
 		// Check if the instance is in the process of deletion, and it's the last remaining reader instance
 		if *instance.DBInstanceStatus == "deleting" && len(readerInstances) == 1 {
-			fmt.Printf("The last remaining instance %s is already in status 'deleting'. Will not remove it to avoid service disruption.\n", *instance.DBInstanceIdentifier)
+			s.logger.Info().Str("InstanceID", *instance.DBInstanceIdentifier).Msg("The last remaining instance is already in status 'deleting'. Will not remove it to avoid service disruption.")
 			break
 		}
 
 		// Skip over instances with the status "deleting"
 		if *instance.DBInstanceStatus == "deleting" {
-			fmt.Printf("Skipping instance %s already in status 'deleting'.\n", *instance.DBInstanceIdentifier)
+			s.logger.Info().Str("InstanceID", *instance.DBInstanceIdentifier).Msg("Skipping instance already in status 'deleting'")
 			numInstances++
 			readerInstances = readerInstances[1:]
 			continue
 		}
 
 		// Wait for the instance to become deletable
-		fmt.Printf("Waiting for the instance %s (status: %s) to become deletable...\n", *instance.DBInstanceIdentifier, *instance.DBInstanceStatus)
-		err := waitUntilInstanceDeletable(rdsClient, *instance.DBInstanceIdentifier)
+		s.logger.Info().Str("InstanceID", *instance.DBInstanceIdentifier).Str("InstanceStatus", *instance.DBInstanceStatus).Msg("Waiting for the instance to become deletable")
+		err := s.waitUntilInstanceDeletable(*instance.DBInstanceIdentifier)
 		if err != nil {
 			return fmt.Errorf("failed to wait for instance to become deletable: %v", err)
 		}
 
 		// Remove the reader instance
-		_, err = rdsClient.DeleteDBInstance(&rds.DeleteDBInstanceInput{
+		_, err = s.rdsClient.DeleteDBInstance(&rds.DeleteDBInstanceInput{
 			DBInstanceIdentifier: instance.DBInstanceIdentifier,
 			SkipFinalSnapshot:    aws.Bool(true),
 		})
@@ -242,7 +242,7 @@ func ScaleIn(rdsClient *rds.RDS, rdsClusterName string, numInstances uint) error
 			return fmt.Errorf("failed to remove reader instance: %v", err)
 		}
 
-		fmt.Printf("Scaling in operation successful. Removed reader instance: %s\n", *instance.DBInstanceIdentifier)
+		s.logger.Info().Str("InstanceID", *instance.DBInstanceIdentifier).Msg("Scaling in operation successful")
 
 		// Remove the scaled-in instance from the list
 		readerInstances = readerInstances[1:]
@@ -251,86 +251,63 @@ func ScaleIn(rdsClient *rds.RDS, rdsClusterName string, numInstances uint) error
 	return nil
 }
 
-func waitUntilInstanceDeletable(rdsClient *rds.RDS, instanceIdentifier string) error {
-	describeInput := &rds.DescribeDBInstancesInput{
-		DBInstanceIdentifier: aws.String(instanceIdentifier),
-	}
-
-	for {
-		describeOutput, err := rdsClient.DescribeDBInstances(describeInput)
-		if err != nil {
-			return fmt.Errorf("failed to describe RDS instance %s: %v", instanceIdentifier, err)
-		}
-
-		if len(describeOutput.DBInstances) == 0 {
-			return fmt.Errorf("RDS instance %s not found", instanceIdentifier)
-		}
-
-		instanceStatus := *describeOutput.DBInstances[0].DBInstanceStatus
-		if isDeletableStatus(instanceStatus) {
-			fmt.Printf("Instance %s is now in deletable status (%s)\n", instanceIdentifier, instanceStatus)
-			return nil
-		}
-
-		fmt.Printf("Waiting for instance %s to become deletable (current status: %s)...\n", instanceIdentifier, instanceStatus)
-		time.Sleep(5 * time.Second)
-	}
-}
-
-func isDeletableStatus(status string) bool {
-	validStatuses := []string{"available", "backing-up", "creating"}
-	return containsString(validStatuses, status)
-}
-
-// ShouldScaleOut returns true if scaling out is needed based on the current CPU utilization and the maximum number of instances.
-func ShouldScaleOut(cpuUtilization, targetCpuUtil float64, currentSize, minInstances, maxInstances uint) bool {
+// shouldScaleOut returns true if scaling out is needed based on the current CPU utilization and the maximum number of instances.
+func (s *Scaler) shouldScaleOut(cpuUtilization float64, currentSize, minInstances uint) bool {
 	if currentSize < minInstances {
-		fmt.Println("Scaler: Should scale out, currently below minimum instances.")
-		fmt.Printf("Scaler: Actual: %d, Desired: %d\n", currentSize, minInstances)
+		s.logger.Info().
+			Uint("Actual", currentSize).
+			Uint("Desired", minInstances).
+			Msg("Should scale out, currently below minimum instances")
 		return true
 	}
 
-	if cpuUtilization > targetCpuUtil && currentSize < maxInstances {
-		fmt.Printf("Scaler: Should scale out, currently above target CPU utilization. %.2f\n", cpuUtilization)
+	if cpuUtilization > s.config.TargetCpuUtil && currentSize < s.config.MaxInstances {
+		s.logger.Info().
+			Float64("CPUUtilization", cpuUtilization).
+			Uint("CurrentSize", currentSize).
+			Uint("MaxInstances", s.config.MaxInstances).
+			Msg("Should scale out, currently above target CPU utilization")
 		return true
 	}
 
-	fmt.Println("Scaler: No need to scale out")
+	s.logger.Info().Msg("No need to scale out")
 	return false
 }
 
-// CalculateScaleOutInstances calculates the number of instances to scale out based on the maximum number of instances and the current size.
-func CalculateScaleOutInstances(maxInstances, currentSize, scaleOutStep uint) uint {
-	return minInt(scaleOutStep, maxInstances-currentSize)
+// calculateScaleOutReaderCount calculates the number of instances to scale out based on the maximum number of instances and the current size.
+func (s *Scaler) calculateScaleOutReaderCount(currentSize uint) uint {
+	return minInt(s.config.ScaleOutStep, s.config.MaxInstances-currentSize)
 }
 
-// ShouldScaleIn returns true if scaling in is needed based on the current CPU utilization and the minimum number of instances.
-func ShouldScaleIn(cpuUtilization float64, targetCpuUtil float64, currentSize, scaleInStep uint, minInstances uint) bool {
-	if cpuUtilization > targetCpuUtil {
+// shouldScaleIn returns true if scaling in is needed based on the current CPU utilization and the minimum number of instances.
+func (s *Scaler) shouldScaleIn(cpuUtilization float64, currentSize, minInstances uint) bool {
+	if cpuUtilization > s.config.TargetCpuUtil {
 		return false
 	}
 
-	if currentSize < minInstances+scaleInStep {
-		fmt.Println("Scaler: Skipping scaling in: Minimum instance threshold reached.")
+	if currentSize < minInstances+s.config.ScaleInStep {
+		s.logger.Info().Msg("Skipping scaling in: Minimum instance threshold reached.")
 		return false
 	}
 
-	if cpuUtilization <= 50 && (currentSize-scaleInStep) == 0 {
-		fmt.Println("Scaler: Should scale in, CPU utilization is below 50%, scaling in to 0 instances.")
+	if cpuUtilization <= 50 && (currentSize-s.config.ScaleInStep) == 0 {
+		s.logger.Info().Msg("Should scale in, CPU utilization is below 50%, scaling in to 0 instances.")
 		return true
 	}
 
-	predictedCpuUtilization := (cpuUtilization / float64(currentSize)) * float64(currentSize-scaleInStep)
-	if predictedCpuUtilization <= targetCpuUtil {
-		fmt.Printf("Scaler: Should scale in, predicted CPU utilization %.2f is below target.\n", predictedCpuUtilization)
+	predictedCpuUtilization := (cpuUtilization / float64(currentSize)) * float64(currentSize-s.config.ScaleInStep)
+	if predictedCpuUtilization <= s.config.TargetCpuUtil {
+		s.logger.Info().
+			Float64("PredictedCPUUtilization", predictedCpuUtilization).
+			Msg("Should scale in, predicted CPU utilization is below target.")
 		return true
 	}
 
-	fmt.Println("Scaler: No need to scale in.")
+	s.logger.Info().Msg("No need to scale in.")
 	return false
 }
 
-// CalculateScaleInInstances calculates the number of instances to scale in based on the current size and the minimum number of instances.
-func CalculateScaleInInstances(currentSize, minInstances, scaleInStep uint) uint {
-	return minInt(scaleInStep, currentSize-minInstances)
+// calculateScaleInReaderCount calculates the number of instances to scale in based on the current size and the minimum number of instances.
+func (s *Scaler) calculateScaleInReaderCount(currentSize, minInstances uint) uint {
+	return minInt(s.config.ScaleInStep, currentSize-minInstances)
 }

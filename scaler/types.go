@@ -1,10 +1,12 @@
 package scaler
 
 import (
+	"github.com/rs/zerolog"
+	"time"
+
 	"github.com/aws/aws-sdk-go/service/cloudwatch"
 	"github.com/aws/aws-sdk-go/service/rds"
 	"predictive-rds-scaler/history"
-	"time"
 )
 
 type Config struct {
@@ -22,11 +24,12 @@ type Config struct {
 
 type Scaler struct {
 	config           Config
-	scaleOut         Cooldown
-	scaleIn          Cooldown
+	scaleOutStatus   Cooldown
+	scaleInStatus    Cooldown
 	rdsClient        *rds.RDS
 	cloudWatchClient *cloudwatch.CloudWatch
 	dynamoDbHistory  *history.History
+	logger           *zerolog.Logger
 }
 
 type Cooldown struct {

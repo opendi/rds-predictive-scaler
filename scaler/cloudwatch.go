@@ -15,18 +15,20 @@ const (
 	periodInterval       = 300 // 5 minutes interval
 )
 
+// ...
+
 // GetMaxCPUUtilization returns the maximum CPU utilization among all RDS instances in the cluster.
-func GetMaxCPUUtilization(readerInstances []*rds.DBInstance, writerInstance *rds.DBInstance, cloudWatchClient *cloudwatch.CloudWatch) (float64, uint, error) {
-	fmt.Println()
-	printTableHeader()
-	printTableSeparator()
+func (s *Scaler) getMaxCPUUtilization(readerInstances []*rds.DBInstance, writerInstance *rds.DBInstance) (float64, uint, error) {
+	s.logger.Info().Msg("")
+	s.printTableHeader()
+	s.printTableSeparator()
 
 	maxCPUUtilization := 0.0
 	availableReaderCount := uint(0)
 
 	for _, instance := range readerInstances {
 		var isStatusAvailable bool
-		maxCPUUtilization, isStatusAvailable = getInstanceMetric(instance, cloudWatchClient, maxCPUUtilization)
+		maxCPUUtilization, isStatusAvailable = s.getInstanceMetric(instance, maxCPUUtilization)
 
 		if isStatusAvailable {
 			availableReaderCount++
@@ -34,17 +36,15 @@ func GetMaxCPUUtilization(readerInstances []*rds.DBInstance, writerInstance *rds
 	}
 
 	if maxCPUUtilization == 0.0 {
-		maxCPUUtilization, _ = getInstanceMetric(writerInstance, cloudWatchClient, maxCPUUtilization)
+		maxCPUUtilization, _ = s.getInstanceMetric(writerInstance, maxCPUUtilization)
 	}
 
-	printTableSeparator()
-	fmt.Printf("%-*s%s%-20s%s%-.2f%%\n", maxInstanceNameWidth, "Max", tableColumnSeparator, " ", tableColumnSeparator, maxCPUUtilization)
-	fmt.Println()
-
+	s.printTableSeparator()
+	s.logger.Info().Float64("MaxCPUUtilization", maxCPUUtilization).Msg("")
 	return maxCPUUtilization, availableReaderCount, nil
 }
 
-func getInstanceMetric(instance *rds.DBInstance, cloudWatchClient *cloudwatch.CloudWatch, maxCPUUtilization float64) (float64, bool) {
+func (s *Scaler) getInstanceMetric(instance *rds.DBInstance, maxCPUUtilization float64) (float64, bool) {
 	var (
 		metricValue       = 0.0
 		err               error
@@ -52,13 +52,17 @@ func getInstanceMetric(instance *rds.DBInstance, cloudWatchClient *cloudwatch.Cl
 	)
 
 	if isStatusAvailable {
-		metricValue, err = getMetricData(cloudWatchClient, *instance.DBInstanceIdentifier, "CPUUtilization")
+		metricValue, err = s.getMetricData(*instance.DBInstanceIdentifier, "CPUUtilization")
 		if err != nil {
-			fmt.Printf("failed to get CPU utilization for instance %s: %v", *instance.DBInstanceIdentifier, err)
+			s.logger.Error().Err(err).Str("InstanceID", *instance.DBInstanceIdentifier).Msg("Failed to get CPU utilization")
 		}
 	}
 
-	fmt.Printf("%-*s%s%-20s%s%.2f%%\n", maxInstanceNameWidth, *instance.DBInstanceIdentifier, tableColumnSeparator, *instance.DBInstanceStatus, tableColumnSeparator, metricValue)
+	s.logger.Info().
+		Str("InstanceID", *instance.DBInstanceIdentifier).
+		Str("InstanceStatus", *instance.DBInstanceStatus).
+		Float64("MetricValue", metricValue).
+		Msg("Instance metrics")
 
 	if metricValue > maxCPUUtilization {
 		maxCPUUtilization = metricValue
@@ -67,7 +71,7 @@ func getInstanceMetric(instance *rds.DBInstance, cloudWatchClient *cloudwatch.Cl
 }
 
 // getMetricData retrieves the metric data for the given metric and DB instance.
-func getMetricData(cloudWatchClient *cloudwatch.CloudWatch, instanceIdentifier, metricName string) (float64, error) {
+func (s *Scaler) getMetricData(instanceIdentifier, metricName string) (float64, error) {
 	metricInput := &cloudwatch.GetMetricDataInput{
 		MetricDataQueries: []*cloudwatch.MetricDataQuery{
 			{
@@ -93,7 +97,7 @@ func getMetricData(cloudWatchClient *cloudwatch.CloudWatch, instanceIdentifier, 
 		EndTime:   aws.Time(time.Now()),
 	}
 
-	metricDataOutput, err := cloudWatchClient.GetMetricData(metricInput)
+	metricDataOutput, err := s.cloudWatchClient.GetMetricData(metricInput)
 	if err != nil {
 		return 0, err
 	}
@@ -107,11 +111,11 @@ func getMetricData(cloudWatchClient *cloudwatch.CloudWatch, instanceIdentifier, 
 }
 
 // printTableHeader prints the header of the CPU utilization table.
-func printTableHeader() {
-	fmt.Printf("%-*s%s%-20s%s%-20s\n", maxInstanceNameWidth, "Instance", tableColumnSeparator, "Status", tableColumnSeparator, "CPU Utilization")
+func (s *Scaler) printTableHeader() {
+	s.logger.Info().Msgf("%-*s%s%-20s%s%-20s", maxInstanceNameWidth, "Instance", tableColumnSeparator, "Status", tableColumnSeparator, "CPU Utilization")
 }
 
 // printTableSeparator prints a line of "-" with given column width.
-func printTableSeparator() {
-	fmt.Println(strings.Repeat("-", maxInstanceNameWidth) + tableColumnSeparator + strings.Repeat("-", 20) + tableColumnSeparator + strings.Repeat("-", 20))
+func (s *Scaler) printTableSeparator() {
+	s.logger.Info().Msgf(strings.Repeat("-", maxInstanceNameWidth) + tableColumnSeparator + strings.Repeat("-", 20) + tableColumnSeparator + strings.Repeat("-", 20))
 }

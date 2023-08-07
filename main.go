@@ -3,7 +3,8 @@ package main
 import (
 	"flag"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"log"
+	"github.com/rs/zerolog/log"
+	"predictive-rds-scaler/logutil"
 	"predictive-rds-scaler/scaler"
 	"time"
 )
@@ -26,16 +27,22 @@ func init() {
 }
 
 func main() {
+	logutil.InitLogger()
+
 	awsSession, err := session.NewSessionWithOptions(session.Options{
 		SharedConfigState: session.SharedConfigEnable,
 	})
+
 	if err != nil {
-		log.Fatal("Failed to create AWS session:", err)
+		log.Fatal().Err(err).Msg("Failed to create AWS session")
 	}
 
-	rdsScaler, err := scaler.New(config, awsSession)
+	// Create the logger
+	logger := logutil.GetLogger()
+
+	rdsScaler, err := scaler.New(config, logger, awsSession)
 	if err != nil {
-		log.Fatal("Failed to create scaler:", err)
+		logger.Fatal().Err(err).Msg("Failed to create scaler")
 	}
 
 	rdsScaler.Run()

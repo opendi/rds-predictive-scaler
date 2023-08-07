@@ -42,18 +42,18 @@ const (
 	StatusUpgrading                                    = 0x40000000         // 1073741824
 )
 
-func getWriterInstance(rdsClient *rds.RDS, rdsClusterName string) (*rds.DBInstance, error) {
+func (s *Scaler) getWriterInstance() (*rds.DBInstance, error) {
 	describeInput := &rds.DescribeDBClustersInput{
-		DBClusterIdentifier: aws.String(rdsClusterName),
+		DBClusterIdentifier: aws.String(s.config.RdsClusterName),
 	}
 
-	clusterOutput, err := rdsClient.DescribeDBClusters(describeInput)
+	clusterOutput, err := s.rdsClient.DescribeDBClusters(describeInput)
 	if err != nil {
 		return nil, err
 	}
 
 	if len(clusterOutput.DBClusters) == 0 {
-		return nil, fmt.Errorf("aurora cluster not found: %s", rdsClusterName)
+		return nil, fmt.Errorf("aurora cluster not found: %s", s.config.RdsClusterName)
 	}
 
 	// Loop through the cluster members to find the writer instance
@@ -63,7 +63,7 @@ func getWriterInstance(rdsClient *rds.RDS, rdsClusterName string) (*rds.DBInstan
 				DBInstanceIdentifier: member.DBInstanceIdentifier,
 			}
 
-			instanceOutput, err := rdsClient.DescribeDBInstances(describeInstanceInput)
+			instanceOutput, err := s.rdsClient.DescribeDBInstances(describeInstanceInput)
 			if err != nil {
 				return nil, err
 			}
@@ -72,29 +72,29 @@ func getWriterInstance(rdsClient *rds.RDS, rdsClusterName string) (*rds.DBInstan
 				return instanceOutput.DBInstances[0], nil
 			}
 
-			return nil, fmt.Errorf("Writer instance not found in cluster: %s", rdsClusterName)
+			return nil, fmt.Errorf("writer instance not found in cluster: %s", s.config.RdsClusterName)
 		}
 	}
 
-	return nil, fmt.Errorf("Writer instance not found in cluster: %s", rdsClusterName)
+	return nil, fmt.Errorf("writer instance not found in cluster: %s", s.config.RdsClusterName)
 }
 
-func getReaderInstances(rdsClient *rds.RDS, rdsClusterName string, statusFilter uint64) ([]*rds.DBInstance, uint, error) {
+func (s *Scaler) getReaderInstances(statusFilter uint64) ([]*rds.DBInstance, uint, error) {
 	describeInput := &rds.DescribeDBInstancesInput{
 		Filters: []*rds.Filter{
 			{
 				Name:   aws.String("db-cluster-id"),
-				Values: []*string{aws.String(rdsClusterName)},
+				Values: []*string{aws.String(s.config.RdsClusterName)},
 			},
 		},
 	}
 
-	describeOutput, err := rdsClient.DescribeDBInstances(describeInput)
+	describeOutput, err := s.rdsClient.DescribeDBInstances(describeInput)
 	if err != nil {
 		return nil, 0, fmt.Errorf("error describing RDS instances", err)
 	}
 
-	writerInstance, err := getWriterInstance(rdsClient, rdsClusterName)
+	writerInstance, err := s.getWriterInstance()
 	if err != nil {
 		return nil, 0, fmt.Errorf("error describing RDS writer instance", err)
 	}
@@ -111,7 +111,7 @@ func getReaderInstances(rdsClient *rds.RDS, rdsClusterName string, statusFilter 
 	return readerInstances, uint(len(readerInstances)), nil
 }
 
-func waitForInstancesAvailable(rdsClient *rds.RDS, instanceIdentifiers []string) error {
+func (s *Scaler) waitForInstancesAvailable(instanceIdentifiers []string) error {
 	describeInput := &rds.DescribeDBInstancesInput{
 		DBInstanceIdentifier: aws.String("dummy"), // Placeholder value, it will be overridden in the loop
 	}
@@ -123,7 +123,7 @@ func waitForInstancesAvailable(rdsClient *rds.RDS, instanceIdentifiers []string)
 		for _, instanceIdentifier := range instanceIdentifiers {
 			describeInput.DBInstanceIdentifier = aws.String(instanceIdentifier)
 
-			describeOutput, err := rdsClient.DescribeDBInstances(describeInput)
+			describeOutput, err := s.rdsClient.DescribeDBInstances(describeInput)
 			if err != nil {
 				return fmt.Errorf("failed to describe RDS instance %s: %v", instanceIdentifier, err)
 			}
@@ -134,7 +134,7 @@ func waitForInstancesAvailable(rdsClient *rds.RDS, instanceIdentifiers []string)
 
 			instanceStatus := *describeOutput.DBInstances[0].DBInstanceStatus
 			if instanceStatus != "available" {
-				fmt.Printf("Instance %s is not yet 'Available' (current status: %s)\n", instanceIdentifier, instanceStatus)
+				s.logger.Info().Str("InstanceIdentifier", instanceIdentifier).Str("InstanceStatus", instanceStatus).Msg("Instance is not yet 'Available'")
 				allInstancesReady = false // At least one instance is not ready, so not all are ready
 			}
 		}
@@ -145,6 +145,37 @@ func waitForInstancesAvailable(rdsClient *rds.RDS, instanceIdentifiers []string)
 	}
 
 	return nil
+}
+
+func (s *Scaler) waitUntilInstanceDeletable(instanceIdentifier string) error {
+	describeInput := &rds.DescribeDBInstancesInput{
+		DBInstanceIdentifier: aws.String(instanceIdentifier),
+	}
+
+	for {
+		describeOutput, err := s.rdsClient.DescribeDBInstances(describeInput)
+		if err != nil {
+			return fmt.Errorf("failed to describe RDS instance %s: %v", instanceIdentifier, err)
+		}
+
+		if len(describeOutput.DBInstances) == 0 {
+			return fmt.Errorf("RDS instance %s not found", instanceIdentifier)
+		}
+
+		instanceStatus := *describeOutput.DBInstances[0].DBInstanceStatus
+		if isDeletableStatus(instanceStatus) {
+			s.logger.Info().Str("InstanceIdentifier", instanceIdentifier).Str("InstanceStatus", instanceStatus).Msg("Instance is now in deletable status")
+			return nil
+		}
+
+		s.logger.Info().Str("InstanceIdentifier", instanceIdentifier).Str("InstanceStatus", instanceStatus).Msg("Waiting for instance to become deletable")
+		time.Sleep(5 * time.Second)
+	}
+}
+
+func isDeletableStatus(status string) bool {
+	validStatuses := []string{"available", "backing-up", "creating"}
+	return containsString(validStatuses, status)
 }
 
 func getStatusBitMask(status string) uint64 {
