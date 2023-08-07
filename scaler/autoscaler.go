@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/rds"
 	"github.com/rs/zerolog"
 	"predictive-rds-scaler/history"
+	"strconv"
 	"time"
 )
 
@@ -71,10 +72,10 @@ func (s *Scaler) Run() {
 		}
 
 		s.logger.Info().
-			Float64("CPUUtilization", cpuUtilization).
+			Str("CPUUtilization", strconv.FormatFloat(cpuUtilization, 'f', 2, 64)).
 			Uint("CurrentReaders", currentSize).
-			Dur("ScaleOutCooldownRemaining", calculateRemainingCooldown(s.config.ScaleOutCooldown, s.scaleOutStatus.LastTime)).
-			Dur("ScaleInCooldownRemaining", calculateRemainingCooldown(s.config.ScaleInCooldown, s.scaleInStatus.LastTime)).
+			Float64("ScaleOutCooldownRemaining", calculateRemainingCooldown(s.config.ScaleOutCooldown, s.scaleOutStatus.LastTime).Seconds()).
+			Float64("ScaleInCooldownRemaining", calculateRemainingCooldown(s.config.ScaleInCooldown, s.scaleInStatus.LastTime).Seconds()).
 			Msg("Scaler status")
 
 		if !s.scaleOutStatus.InCooldown && s.shouldScaleOut(cpuUtilization, currentSize, minInstances) {
@@ -148,6 +149,25 @@ func (s *Scaler) scaleOut(readerNamePrefix string, numInstances uint) error {
 	currentHour := time.Now().Hour()
 	newReaderInstanceNames := make([]string, numInstances)
 
+	startingInstances, numStartingInstances, err := s.getReaderInstances(StatusCreating | StatusConfiguringEnhancedMonitoring)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("Error getting starting instances")
+	}
+
+	if numStartingInstances > 0 {
+		s.logger.Info().Msg("Waiting for starting instances to be ready")
+		instanceIdentifiers := make([]string, len(startingInstances))
+		for i, instance := range startingInstances {
+			instanceIdentifiers[i] = *instance.DBInstanceIdentifier
+		}
+
+		err = s.waitForInstancesAvailable(instanceIdentifiers)
+		if err != nil {
+			s.logger.Warn().Err(err).Msg("error waiting for starting instances to be ready")
+		}
+		numInstances -= numStartingInstances
+	}
+
 	for i := 0; i < int(numInstances); i++ {
 		// Get the current writer instance
 		writerInstance, err := s.getWriterInstance()
@@ -188,7 +208,7 @@ func (s *Scaler) scaleOut(readerNamePrefix string, numInstances uint) error {
 
 	// Wait for all new reader instances to become "Available"
 	s.logger.Info().Msg("Waiting for all new reader instances to become 'Available'...")
-	err := s.waitForInstancesAvailable(newReaderInstanceNames)
+	err = s.waitForInstancesAvailable(newReaderInstanceNames)
 	if err != nil {
 		return fmt.Errorf("failed to wait for the new reader instances to become 'Available': %v", err)
 	}

@@ -5,24 +5,16 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/cloudwatch"
 	"github.com/aws/aws-sdk-go/service/rds"
-	"strings"
+	"strconv"
 	"time"
 )
 
 const (
-	maxInstanceNameWidth = 50
-	tableColumnSeparator = " | "
-	periodInterval       = 300 // 5 minutes interval
+	periodInterval = 300 // 5 minutes interval
 )
-
-// ...
 
 // GetMaxCPUUtilization returns the maximum CPU utilization among all RDS instances in the cluster.
 func (s *Scaler) getMaxCPUUtilization(readerInstances []*rds.DBInstance, writerInstance *rds.DBInstance) (float64, uint, error) {
-	s.logger.Info().Msg("")
-	s.printTableHeader()
-	s.printTableSeparator()
-
 	maxCPUUtilization := 0.0
 	availableReaderCount := uint(0)
 
@@ -39,8 +31,7 @@ func (s *Scaler) getMaxCPUUtilization(readerInstances []*rds.DBInstance, writerI
 		maxCPUUtilization, _ = s.getInstanceMetric(writerInstance, maxCPUUtilization)
 	}
 
-	s.printTableSeparator()
-	s.logger.Info().Float64("MaxCPUUtilization", maxCPUUtilization).Msg("")
+	s.logger.Info().Float64("MaxCPUUtilization", maxCPUUtilization).Msg("Max CPU utilization")
 	return maxCPUUtilization, availableReaderCount, nil
 }
 
@@ -61,7 +52,7 @@ func (s *Scaler) getInstanceMetric(instance *rds.DBInstance, maxCPUUtilization f
 	s.logger.Info().
 		Str("InstanceID", *instance.DBInstanceIdentifier).
 		Str("InstanceStatus", *instance.DBInstanceStatus).
-		Float64("MetricValue", metricValue).
+		Str("MetricValue", strconv.FormatFloat(metricValue, 'f', 2, 64)).
 		Msg("Instance metrics")
 
 	if metricValue > maxCPUUtilization {
@@ -108,14 +99,4 @@ func (s *Scaler) getMetricData(instanceIdentifier, metricName string) (float64, 
 	}
 
 	return 0, fmt.Errorf("no %s data available", metricName)
-}
-
-// printTableHeader prints the header of the CPU utilization table.
-func (s *Scaler) printTableHeader() {
-	s.logger.Info().Msgf("%-*s%s%-20s%s%-20s", maxInstanceNameWidth, "Instance", tableColumnSeparator, "Status", tableColumnSeparator, "CPU Utilization")
-}
-
-// printTableSeparator prints a line of "-" with given column width.
-func (s *Scaler) printTableSeparator() {
-	s.logger.Info().Msgf(strings.Repeat("-", maxInstanceNameWidth) + tableColumnSeparator + strings.Repeat("-", 20) + tableColumnSeparator + strings.Repeat("-", 20))
 }
