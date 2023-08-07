@@ -1,8 +1,9 @@
 package history
 
 import (
-	"github.com/aws/aws-sdk-go/aws"
+	"context"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/rs/zerolog"
 )
 
 type Item struct {
@@ -15,6 +16,7 @@ type Item struct {
 
 type History struct {
 	client      *dynamodb.DynamoDB
-	context     aws.Context
 	clusterName string
+	context     context.Context
+	logger      *zerolog.Logger
 }
