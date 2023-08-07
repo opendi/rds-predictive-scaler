@@ -8,25 +8,23 @@ on:
 jobs:
   buildx:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v3
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
-
       - name: Set up Docker Buildx
-        id: buildx
         uses: docker/setup-buildx-action@v2.5.0
 
       - name: Login to Docker Hub
         run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
-      - name: Build and Push Docker Image
-        run: |
-          docker buildx build \
-            --file Dockerfile \
-            --platform linux/amd64,linux/arm64,linux/arm/v7 \
-            --tag opendi/predictive-rds-scaler:${{ github.ref_name }} \
-            --push .
+      - name: Build, tag, and push image to Docker Hub
+        uses: docker/build-push-action@v4
+        id: build-image
+        with:
+          context: .
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: opendi/predictive-rds-scaler:latest,opendi/predictive-rds-scaler:${{ github.ref_name }}
