@@ -5,6 +5,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/rds"
 	"math/rand"
+	"strconv"
 	"time"
 )
 
@@ -171,6 +172,56 @@ func (s *Scaler) waitUntilInstanceDeletable(instanceIdentifier string) error {
 		s.logger.Info().Str("InstanceIdentifier", instanceIdentifier).Str("InstanceStatus", instanceStatus).Msg("Waiting for instance to become deletable")
 		time.Sleep(5 * time.Second)
 	}
+}
+
+func (s *Scaler) storeLastTimeInClusterTags(tagKey string, lastTime time.Time) error {
+	clusterArn, err := s.getClusterArn()
+	if err != nil {
+		return err
+	}
+
+	tagInput := &rds.AddTagsToResourceInput{
+		ResourceName: aws.String(clusterArn), // Assuming you have the RDS cluster ARN available in your Scaler struct
+		Tags: []*rds.Tag{
+			{
+				Key:   aws.String(tagKey),
+				Value: aws.String(strconv.FormatInt(lastTime.Unix(), 10)), // Store as Unix timestamp
+			},
+		},
+	}
+
+	_, err = s.rdsClient.AddTagsToResource(tagInput)
+	return err
+}
+
+func (s *Scaler) getClusterArn() (string, error) {
+	describeDBClustersInput := &rds.DescribeDBClustersInput{
+		DBClusterIdentifier: aws.String(s.config.RdsClusterName),
+	}
+	describeDBClustersOutput, err := s.rdsClient.DescribeDBClusters(describeDBClustersInput)
+	if err != nil {
+		return "", fmt.Errorf("failed to describe DB clusters: %v", err)
+	}
+
+	return *describeDBClustersOutput.DBClusters[0].DBClusterArn, nil
+}
+
+func (s *Scaler) getClusterTags(clusterArn string) (map[string]string, error) {
+	input := &rds.ListTagsForResourceInput{
+		ResourceName: aws.String(clusterArn),
+	}
+
+	result, err := s.rdsClient.ListTagsForResource(input)
+	if err != nil {
+		return nil, err
+	}
+
+	tags := make(map[string]string)
+	for _, tag := range result.TagList {
+		tags[*tag.Key] = *tag.Value
+	}
+
+	return tags, nil
 }
 
 func isDeletableStatus(status string) bool {

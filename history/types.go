@@ -6,7 +6,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
-type Item struct {
+type UtilizationSnapshot struct {
 	Timestamp         string  `json:"timestamp"`
 	NumReaders        uint    `json:"num_readers"`
 	MaxCpuUtilization float64 `json:"max_cpu_utilization"`

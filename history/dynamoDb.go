@@ -35,7 +35,7 @@ func (h *History) SaveItem(numReaders uint, maxCpuUtilization float64) error {
 	// Calculate the TTL value (8 days from the current timestamp)
 	ttl := time.Now().Add(8 * 24 * time.Hour).Unix()
 
-	item := Item{
+	snapshot := UtilizationSnapshot{
 		Timestamp:         time.Now().Truncate(10 * time.Second).Format(time.RFC3339),
 		ClusterName:       h.clusterName,
 		NumReaders:        numReaders,
@@ -43,9 +43,9 @@ func (h *History) SaveItem(numReaders uint, maxCpuUtilization float64) error {
 		TTL:               ttl,
 	}
 
-	av, err := dynamodbattribute.MarshalMap(item)
+	av, err := dynamodbattribute.MarshalMap(snapshot)
 	if err != nil {
-		return fmt.Errorf("failed to marshal DynamoDB item: %v", err)
+		return fmt.Errorf("failed to marshal DynamoDB snapshot: %v", err)
 	}
 
 	input := &dynamodb.PutItemInput{
@@ -55,7 +55,7 @@ func (h *History) SaveItem(numReaders uint, maxCpuUtilization float64) error {
 
 	_, err = h.client.PutItemWithContext(h.context, input) // Pass the context here
 	if err != nil {
-		return fmt.Errorf("failed to put item into DynamoDB: %v", err)
+		return fmt.Errorf("failed to put snapshot into DynamoDB: %v", err)
 	}
 
 	return nil
@@ -89,12 +89,12 @@ func (h *History) GetValue(lookupTime time.Time) (float64, uint, error) {
 	}
 
 	if len(result.Items) > 0 {
-		item := Item{}
-		err := dynamodbattribute.UnmarshalMap(result.Items[0], &item)
+		snapshot := UtilizationSnapshot{}
+		err := dynamodbattribute.UnmarshalMap(result.Items[0], &snapshot)
 		if err != nil {
-			return 0, 0, fmt.Errorf("failed to unmarshal DynamoDB item: %v", err)
+			return 0, 0, fmt.Errorf("failed to unmarshal DynamoDB snapshot: %v", err)
 		}
-		return item.MaxCpuUtilization, item.NumReaders, nil
+		return snapshot.MaxCpuUtilization, snapshot.NumReaders, nil
 	}
 
 	// No value found for the last week, return 0

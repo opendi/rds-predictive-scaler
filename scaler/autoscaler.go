@@ -49,17 +49,30 @@ func (s *Scaler) Run() {
 		return
 	}
 
+	// Retrieve scale-out and scale-in LastTime values from cluster tags
+	s.scaleOutStatus, err = s.getLastTimeFromClusterTags("ScaleOutLastTime", s.config.ScaleOutCooldown)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("Error retrieving scale-out LastTime value from cluster tags")
+	}
+
+	s.scaleInStatus, err = s.getLastTimeFromClusterTags("ScaleInLastTime", s.config.ScaleInCooldown)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("Error retrieving scale-in LastTime value from cluster tags")
+	}
+
 	for range ticker.C {
 		writerInstance, err := s.getWriterInstance()
 		if err != nil {
 			s.logger.Error().Err(err).Msg("Error getting writer instance")
 			continue
 		}
+
 		readerInstances, currentSize, err := s.getReaderInstances(StatusAll ^ StatusDeleting)
 		if err != nil {
 			s.logger.Error().Err(err).Msg("Error getting reader instances")
 			continue
 		}
+
 		cpuUtilization, err := s.getUtilization(readerInstances, writerInstance)
 		if err != nil {
 			s.logger.Error().Err(err).Msg("Error getting CPU utilization")
@@ -74,8 +87,8 @@ func (s *Scaler) Run() {
 		s.logger.Info().
 			Str("CPUUtilization", strconv.FormatFloat(cpuUtilization, 'f', 2, 64)).
 			Uint("CurrentReaders", currentSize).
-			Float64("ScaleOutCooldownRemaining", calculateRemainingCooldown(s.config.ScaleOutCooldown, s.scaleOutStatus.LastTime).Seconds()).
-			Float64("ScaleInCooldownRemaining", calculateRemainingCooldown(s.config.ScaleInCooldown, s.scaleInStatus.LastTime).Seconds()).
+			Int("ScaleOutCooldownRemaining", int(calculateRemainingCooldown(s.config.ScaleOutCooldown, s.scaleOutStatus.LastTime).Seconds())).
+			Int("ScaleInCooldownRemaining", int(calculateRemainingCooldown(s.config.ScaleInCooldown, s.scaleInStatus.LastTime).Seconds())).
 			Msg("Scaler status")
 
 		if !s.scaleOutStatus.InCooldown && s.shouldScaleOut(cpuUtilization, currentSize, minInstances) {
@@ -88,6 +101,11 @@ func (s *Scaler) Run() {
 				} else {
 					s.scaleOutStatus.InCooldown = true
 					s.scaleOutStatus.LastTime = time.Now()
+
+					err := s.storeLastTimeInClusterTags("ScaleOutLastTime", s.scaleOutStatus.LastTime)
+					if err != nil {
+						s.logger.Warn().Err(err).Msg("Error storing scale-out LastTime value in cluster tags")
+					}
 					time.AfterFunc(s.config.ScaleOutCooldown, func() {
 						s.scaleOutStatus.InCooldown = false
 					})
@@ -105,6 +123,10 @@ func (s *Scaler) Run() {
 				} else {
 					s.scaleInStatus.InCooldown = true
 					s.scaleInStatus.LastTime = time.Now()
+					err := s.storeLastTimeInClusterTags("ScaleInLastTime", s.scaleInStatus.LastTime)
+					if err != nil {
+						s.logger.Warn().Err(err).Msg("Error storing scale-out LastTime value in cluster tags")
+					}
 					time.AfterFunc(s.config.ScaleInCooldown, func() {
 						s.scaleInStatus.InCooldown = false
 					})
@@ -117,8 +139,8 @@ func (s *Scaler) Run() {
 }
 
 func (s *Scaler) getUtilization(readerInstances []*rds.DBInstance, writerInstance *rds.DBInstance) (float64, error) {
-	lastWeekTime := time.Now().Add(-time.Hour * 24 * 7).Add(time.Minute * 10) // last week, 10 minutes into the future
-	lastWeekCpuUtilization, lastWeekCount, err := s.dynamoDbHistory.GetValue(lastWeekTime)
+	historicQueryTime := time.Now().Add(-time.Hour * 24 * 7).Add(time.Minute * 10) // last week, 10 minutes into the future
+	historicCpuUtilization, historicReaderCount, err := s.dynamoDbHistory.GetValue(historicQueryTime)
 	if err != nil {
 		return 0, fmt.Errorf("error getting historic value: %v", err)
 	}
@@ -135,13 +157,18 @@ func (s *Scaler) getUtilization(readerInstances []*rds.DBInstance, writerInstanc
 		}
 	}
 
-	if lastWeekCpuUtilization != 0 {
-		interpolated := (lastWeekCpuUtilization * float64(currentActiveReaderCount+1)) / float64(lastWeekCount+1)
-		if interpolated > currentCpuUtilization {
-			currentCpuUtilization = interpolated
+	if historicCpuUtilization != 0 {
+		predictedCpuUtilization := historicCpuUtilization * (float64(historicReaderCount+1) / float64(currentActiveReaderCount+1))
+		s.logger.Info().
+			Float64("HistoricCpuUtilization", historicCpuUtilization).
+			Uint("HistoricReaderCount", historicReaderCount).
+			Float64("PredictedCpuUtilization", predictedCpuUtilization).
+			Float64("CurrentCPUUtilization", currentCpuUtilization).
+			Msg("Historic value found.")
+		if predictedCpuUtilization > currentCpuUtilization {
+			currentCpuUtilization = predictedCpuUtilization
 		}
 	}
-
 	return currentCpuUtilization, nil
 }
 
@@ -300,22 +327,36 @@ func (s *Scaler) calculateScaleOutReaderCount(currentSize uint) uint {
 }
 
 // shouldScaleIn returns true if scaling in is needed based on the current CPU utilization and the minimum number of instances.
-func (s *Scaler) shouldScaleIn(cpuUtilization float64, currentSize, minInstances uint) bool {
-	if cpuUtilization > s.config.TargetCpuUtil {
+func (s *Scaler) shouldScaleIn(currentCpuUtilization float64, currentSize, minInstances uint) bool {
+	if currentCpuUtilization > s.config.TargetCpuUtil {
 		return false
 	}
 
 	if currentSize < minInstances+s.config.ScaleInStep {
-		s.logger.Info().Msg("Skipping scaling in: Minimum instance threshold reached.")
+		s.logger.Info().Msg("Skipping scale in: Minimum instance threshold reached.")
 		return false
 	}
 
-	if cpuUtilization <= 50 && (currentSize-s.config.ScaleInStep) == 0 {
-		s.logger.Info().Msg("Should scale in, CPU utilization is below 50%, scaling in to 0 instances.")
-		return true
+	if (currentSize - s.config.ScaleInStep) == 0 {
+		if currentCpuUtilization <= 50 {
+			s.logger.Info().Msg("Should scale in, CPU utilization is below 45%, scaling in to 0 reader instances.")
+			return true
+		} else {
+			return false
+		}
 	}
 
-	predictedCpuUtilization := (cpuUtilization / float64(currentSize)) * float64(currentSize-s.config.ScaleInStep)
+	predictedCpuUtilization := (currentCpuUtilization * float64(currentSize)) / float64(currentSize-s.config.ScaleInStep)
+	if predictedCpuUtilization == 0 {
+		s.logger.Debug().
+			Int("currentSize", int(currentSize)).
+			Int("scaleInStep", int(s.config.ScaleInStep)).
+			Float64("currentCpuUtilization", currentCpuUtilization).
+			Float64("predictedCPUUtilization", predictedCpuUtilization).
+			Msg("Skipping scale in: Predicted CPU utilization is 0, somebody messed up the math.")
+		return false
+	}
+
 	if predictedCpuUtilization <= s.config.TargetCpuUtil {
 		s.logger.Info().
 			Float64("PredictedCPUUtilization", predictedCpuUtilization).
@@ -330,4 +371,34 @@ func (s *Scaler) shouldScaleIn(cpuUtilization float64, currentSize, minInstances
 // calculateScaleInReaderCount calculates the number of instances to scale in based on the current size and the minimum number of instances.
 func (s *Scaler) calculateScaleInReaderCount(currentSize, minInstances uint) uint {
 	return minInt(s.config.ScaleInStep, currentSize-minInstances)
+}
+
+func (s *Scaler) getLastTimeFromClusterTags(tagName string, cooldownDuration time.Duration) (Cooldown, error) {
+	cooldown := Cooldown{}
+
+	clusterArn, err := s.getClusterArn()
+	if err != nil {
+		return cooldown, err
+	}
+
+	tags, err := s.getClusterTags(clusterArn)
+	if err != nil {
+		return cooldown, err
+	}
+
+	lastTimeStr, ok := tags[tagName]
+	if !ok {
+		return cooldown, nil // Tag not found, return empty cooldown
+	}
+
+	unixTimestamp, err := strconv.ParseInt(lastTimeStr, 10, 64)
+	if err != nil {
+		return cooldown, fmt.Errorf("failed to parse LastTime from tag: %v", err)
+	}
+
+	lastTime := time.Unix(unixTimestamp, 0)
+
+	cooldown.LastTime = lastTime
+	cooldown.InCooldown = time.Since(lastTime) <= cooldownDuration
+	return cooldown, nil
 }

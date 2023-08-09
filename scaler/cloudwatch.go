@@ -9,9 +9,7 @@ import (
 	"time"
 )
 
-const (
-	periodInterval = 300 // 5 minutes interval
-)
+const periodInterval = 300 // 5 minutes interval
 
 // GetMaxCPUUtilization returns the maximum CPU utilization among all RDS instances in the cluster.
 func (s *Scaler) getMaxCPUUtilization(readerInstances []*rds.DBInstance, writerInstance *rds.DBInstance) (float64, uint, error) {
