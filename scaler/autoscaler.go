@@ -139,7 +139,7 @@ func (s *Scaler) Run() {
 }
 
 func (s *Scaler) getUtilization(readerInstances []*rds.DBInstance, writerInstance *rds.DBInstance) (float64, error) {
-	historicQueryTime := time.Now().Add(-time.Hour * 24 * 7).Add(time.Minute * 10) // last week, 10 minutes into the future
+	historicQueryTime := time.Now().Add(-time.Hour * 24 * 7).Add(s.config.PlanAheadTime) // last week, 10 minutes into the future
 	historicCpuUtilization, historicReaderCount, err := s.dynamoDbHistory.GetValue(historicQueryTime)
 	if err != nil {
 		return 0, fmt.Errorf("error getting historic value: %v", err)
@@ -158,6 +158,7 @@ func (s *Scaler) getUtilization(readerInstances []*rds.DBInstance, writerInstanc
 	}
 
 	if historicCpuUtilization != 0 {
+		// how high would the historic CPU utilization be with the current reader count?
 		predictedCpuUtilization := historicCpuUtilization * (float64(historicReaderCount+1) / float64(currentActiveReaderCount+1))
 		s.logger.Info().
 			Float64("HistoricCpuUtilization", historicCpuUtilization).

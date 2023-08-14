@@ -22,6 +22,7 @@ func init() {
 	flag.Float64Var(&config.TargetCpuUtil, "targetCpuUtilization", 70.0, "Target CPU utilization percentage")
 	flag.DurationVar(&config.ScaleOutCooldown, "scaleOutCooldown", 10*time.Minute, "Cooldown time after scaling actions to avoid constant scale up/down activity")
 	flag.DurationVar(&config.ScaleInCooldown, "scaleInCooldown", 5*time.Minute, "Cooldown time after scaling actions to avoid constant scale up/down activity")
+	flag.DurationVar(&config.PlanAheadTime, "planAheadTime", 10*time.Minute, "The time to plan ahead when looking up prior CPU utilization")
 
 	flag.Parse()
 }

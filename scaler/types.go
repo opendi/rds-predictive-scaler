@@ -16,6 +16,7 @@ type Config struct {
 	MinInstances     uint
 	BoostHours       string
 	TargetCpuUtil    float64
+	PlanAheadTime    time.Duration
 	ScaleOutCooldown time.Duration
 	ScaleInCooldown  time.Duration
 	ScaleInStep      uint

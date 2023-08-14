@@ -5,6 +5,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/cloudwatch"
 	"github.com/aws/aws-sdk-go/service/rds"
+	"math"
 	"strconv"
 	"time"
 )
@@ -17,23 +18,20 @@ func (s *Scaler) getMaxCPUUtilization(readerInstances []*rds.DBInstance, writerI
 	availableReaderCount := uint(0)
 
 	for _, instance := range readerInstances {
-		var isStatusAvailable bool
-		maxCPUUtilization, isStatusAvailable = s.getInstanceMetric(instance, maxCPUUtilization)
-
-		if isStatusAvailable {
+		cpuUtilization := s.getInstanceUtilization(instance)
+		if *instance.DBInstanceStatus == "available" {
+			maxCPUUtilization = math.Max(maxCPUUtilization, cpuUtilization)
 			availableReaderCount++
 		}
 	}
-
-	if maxCPUUtilization == 0.0 {
-		maxCPUUtilization, _ = s.getInstanceMetric(writerInstance, maxCPUUtilization)
-	}
+	// Writer instance is always available and also read from
+	maxCPUUtilization = math.Max(maxCPUUtilization, s.getInstanceUtilization(writerInstance))
 
 	s.logger.Info().Float64("MaxCPUUtilization", maxCPUUtilization).Msg("Max CPU utilization")
 	return maxCPUUtilization, availableReaderCount, nil
 }
 
-func (s *Scaler) getInstanceMetric(instance *rds.DBInstance, maxCPUUtilization float64) (float64, bool) {
+func (s *Scaler) getInstanceUtilization(instance *rds.DBInstance) float64 {
 	var (
 		metricValue       = 0.0
 		err               error
@@ -53,10 +51,7 @@ func (s *Scaler) getInstanceMetric(instance *rds.DBInstance, maxCPUUtilization f
 		Str("MetricValue", strconv.FormatFloat(metricValue, 'f', 2, 64)).
 		Msg("Instance metrics")
 
-	if metricValue > maxCPUUtilization {
-		maxCPUUtilization = metricValue
-	}
-	return maxCPUUtilization, isStatusAvailable
+	return metricValue
 }
 
 // getMetricData retrieves the metric data for the given metric and DB instance.
