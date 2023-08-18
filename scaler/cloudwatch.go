@@ -24,8 +24,17 @@ func (s *Scaler) getMaxCPUUtilization(readerInstances []*rds.DBInstance, writerI
 			availableReaderCount++
 		}
 	}
+
 	// Writer instance is always available and also read from
-	maxCPUUtilization = math.Max(maxCPUUtilization, s.getInstanceUtilization(writerInstance))
+	// but we can also have pure write pressure so adding readers won't help
+	writerUtilization := s.getInstanceUtilization(writerInstance)
+	if len(readerInstances) == 0 || writerUtilization <= 1.3*maxCPUUtilization {
+		s.logger.Info().
+			Float64("MaxCPUUtilization", maxCPUUtilization).
+			Float64("WriterUtilization", writerUtilization).
+			Msg("Adding writer, no active readers or writer isn't 30% over reader utilization")
+		maxCPUUtilization = math.Max(maxCPUUtilization, writerUtilization)
+	}
 
 	s.logger.Info().Float64("MaxCPUUtilization", maxCPUUtilization).Msg("Max CPU utilization")
 	return maxCPUUtilization, availableReaderCount, nil

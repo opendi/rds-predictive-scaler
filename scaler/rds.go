@@ -165,7 +165,6 @@ func (s *Scaler) waitUntilInstanceDeletable(instanceIdentifier string) error {
 
 		instanceStatus := *describeOutput.DBInstances[0].DBInstanceStatus
 		if isDeletableStatus(instanceStatus) {
-			s.logger.Info().Str("InstanceIdentifier", instanceIdentifier).Str("InstanceStatus", instanceStatus).Msg("Instance is now in deletable status")
 			return nil
 		}
 
@@ -174,7 +173,29 @@ func (s *Scaler) waitUntilInstanceDeletable(instanceIdentifier string) error {
 	}
 }
 
-func (s *Scaler) storeLastTimeInClusterTags(tagKey string, lastTime time.Time) error {
+func (s *Scaler) waitUntilInstanceIsDeleted(instanceIdentifier string) error {
+	describeInput := &rds.DescribeDBInstancesInput{
+		DBInstanceIdentifier: aws.String(instanceIdentifier),
+	}
+
+	for {
+		describeOutput, err := s.rdsClient.DescribeDBInstances(describeInput)
+		if err != nil {
+			return fmt.Errorf("failed to describe RDS instance %s: %v", instanceIdentifier, err)
+		}
+
+		if len(describeOutput.DBInstances) == 0 {
+			return nil
+		}
+
+		instanceStatus := *describeOutput.DBInstances[0].DBInstanceStatus
+
+		s.logger.Info().Str("InstanceIdentifier", instanceIdentifier).Str("InstanceStatus", instanceStatus).Msg("Waiting for instance to be deleted")
+		time.Sleep(5 * time.Second)
+	}
+}
+
+func (s *Scaler) saveCooldownStatus(tagKey string, lastTime time.Time) error {
 	clusterArn, err := s.getClusterArn()
 	if err != nil {
 		return err
@@ -225,8 +246,8 @@ func (s *Scaler) getClusterTags(clusterArn string) (map[string]string, error) {
 }
 
 func isDeletableStatus(status string) bool {
-	validStatuses := []string{"available", "backing-up", "creating"}
-	return containsString(validStatuses, status)
+	invalidStatus := []string{"deleting", "modifying", "maintenance", "rebooting"}
+	return !containsString(invalidStatus, status)
 }
 
 func getStatusBitMask(status string) uint64 {

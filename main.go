@@ -4,6 +4,7 @@ import (
 	"flag"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/rs/zerolog/log"
+	"predictive-rds-scaler/api"
 	"predictive-rds-scaler/logutil"
 	"predictive-rds-scaler/scaler"
 	"time"
@@ -23,6 +24,7 @@ func init() {
 	flag.DurationVar(&config.ScaleOutCooldown, "scaleOutCooldown", 10*time.Minute, "Cooldown time after scaling actions to avoid constant scale up/down activity")
 	flag.DurationVar(&config.ScaleInCooldown, "scaleInCooldown", 5*time.Minute, "Cooldown time after scaling actions to avoid constant scale up/down activity")
 	flag.DurationVar(&config.PlanAheadTime, "planAheadTime", 10*time.Minute, "The time to plan ahead when looking up prior CPU utilization")
+	flag.UintVar(&config.ServerPort, "serverPort", 8041, "Port for the ui server")
 
 	flag.Parse()
 }
@@ -46,5 +48,17 @@ func main() {
 		logger.Fatal().Err(err).Msg("Failed to create scaler")
 	}
 
-	rdsScaler.Run()
+	apiServer, err := api.New(config, logger, awsSession)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("Failed to create API server")
+	}
+
+	defer rdsScaler.Run()
+
+	go func() {
+		err := apiServer.Serve(config.ServerPort)
+		if err != nil {
+			logger.Fatal().Err(err).Msg("Failed to start API server")
+		}
+	}()
 }

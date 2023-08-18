@@ -21,6 +21,7 @@ type Config struct {
 	ScaleInCooldown  time.Duration
 	ScaleInStep      uint
 	ScaleOutStep     uint
+	ServerPort       uint
 }
 
 type Scaler struct {
@@ -34,6 +35,6 @@ type Scaler struct {
 }
 
 type Cooldown struct {
-	InCooldown bool
-	LastTime   time.Time
+	Timeout   time.Time
+	threshold uint
 }
