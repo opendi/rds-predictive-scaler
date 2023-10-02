@@ -32,18 +32,7 @@ func New(ctx context.Context, logger *zerolog.Logger, awsSession *session.Sessio
 	}, nil
 }
 
-func (h *History) SaveItem(numReaders uint, maxCpuUtilization float64, predictedValue bool) error {
-	// Calculate the TTL value (8 days from the current timestamp)
-	ttl := time.Now().Add(8 * 24 * time.Hour).Unix()
-
-	snapshot := UtilizationSnapshot{
-		Timestamp:         time.Now().Truncate(10 * time.Second),
-		ClusterName:       h.clusterName,
-		NumReaders:        numReaders,
-		MaxCpuUtilization: maxCpuUtilization,
-		PredictedValue:    predictedValue,
-		TTL:               ttl,
-	}
+func (h *History) SaveItem(snapshot *UtilizationSnapshot) error {
 
 	av, err := dynamodbattribute.MarshalMap(snapshot)
 	if err != nil {
@@ -51,36 +40,40 @@ func (h *History) SaveItem(numReaders uint, maxCpuUtilization float64, predicted
 	}
 
 	input := &dynamodb.PutItemInput{
-		TableName: aws.String(tableName),
+		TableName: aws.String(tableName), // Make sure `tableName` is defined and correct
 		Item:      av,
 	}
 
-	_, err = h.client.PutItemWithContext(h.context, input) // Pass the context here
+	// Use context.TODO() if you're not using a specific context for this operation
+	_, err = h.client.PutItemWithContext(h.context, input)
 	if err != nil {
 		return fmt.Errorf("failed to put snapshot into DynamoDB: %v", err)
 	}
 
-	return nil
+	return nil // Return a pointer to the snapshot
 }
 
-func (h *History) GetValue(lookupTime time.Time) (float64, uint, error) {
+func (h *History) GetValue(lookupTime time.Time) (*UtilizationSnapshot, error) {
 	// Convert to DynamoDB timestamp format (RFC3339)
-	timeString := lookupTime.Truncate(10 * time.Second).Format(time.RFC3339)
+	end := lookupTime.Add(9 * time.Second)
 
 	input := &dynamodb.QueryInput{
 		TableName:              aws.String(tableName),
 		IndexName:              aws.String("cluster_name-timestamp-index"),
-		KeyConditionExpression: aws.String("cluster_name = :name AND #ts = :ts"),
-		ExpressionAttributeNames: map[string]*string{
-			"#ts": aws.String("timestamp"),
-		},
+		KeyConditionExpression: aws.String("cluster_name = :name AND #timestamp BETWEEN :start AND :end"),
 		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
 			":name": {
 				S: aws.String(h.clusterName),
 			},
-			":ts": {
-				S: aws.String(timeString),
+			":start": {
+				S: aws.String(lookupTime.Format(time.RFC3339)),
 			},
+			":end": {
+				S: aws.String(end.Format(time.RFC3339)),
+			},
+		},
+		ExpressionAttributeNames: map[string]*string{
+			"#timestamp": aws.String("timestamp"),
 		},
 		ScanIndexForward: aws.Bool(false), // Descending order (newest first)
 		Limit:            aws.Int64(1),    // Fetch only the newest item
@@ -88,20 +81,20 @@ func (h *History) GetValue(lookupTime time.Time) (float64, uint, error) {
 
 	result, err := h.client.QueryWithContext(h.context, input) // Pass the context here
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to query DynamoDB: %v", err)
+		return nil, fmt.Errorf("failed to query DynamoDB: %v", err)
 	}
 
 	if len(result.Items) > 0 {
 		snapshot := UtilizationSnapshot{}
 		err := dynamodbattribute.UnmarshalMap(result.Items[0], &snapshot)
 		if err != nil {
-			return 0, 0, fmt.Errorf("failed to unmarshal DynamoDB snapshot: %v", err)
+			return nil, fmt.Errorf("failed to unmarshal DynamoDB snapshot: %v", err)
 		}
-		return snapshot.MaxCpuUtilization, snapshot.NumReaders, nil
+		return &snapshot, nil
 	}
 
 	// No value found for the last week, return 0
-	return 0, 0, nil
+	return nil, nil
 }
 
 func (h *History) GetAllSnapshots(start time.Time) ([]UtilizationSnapshot, error) {
@@ -147,11 +140,50 @@ func (h *History) GetAllSnapshots(start time.Time) ([]UtilizationSnapshot, error
 	return snapshots, nil
 }
 
+func (h *History) GetSnapshotTimeRange(start time.Time, end time.Time) ([]UtilizationSnapshot, error) {
+	input := &dynamodb.QueryInput{
+		TableName:              aws.String(tableName),
+		IndexName:              aws.String("cluster_name-timestamp-index"),
+		KeyConditionExpression: aws.String("cluster_name = :name AND #timestamp BETWEEN :start AND :end"),
+		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
+			":name": {
+				S: aws.String(h.clusterName),
+			},
+			":start": {
+				S: aws.String(start.Format(time.RFC3339)),
+			},
+			":end": {
+				S: aws.String(end.Format(time.RFC3339)),
+			},
+		},
+		ExpressionAttributeNames: map[string]*string{
+			"#timestamp": aws.String("timestamp"),
+		},
+	}
+
+	result, err := h.client.QueryWithContext(h.context, input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query DynamoDB: %v", err)
+	}
+
+	snapshots := make([]UtilizationSnapshot, len(result.Items))
+	err = dynamodbattribute.UnmarshalListOfMaps(result.Items, &snapshots)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal DynamoDB snapshots: %v", err)
+	}
+
+	// Sort snapshots by timestamp in ascending order
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i].Timestamp.Before(snapshots[j].Timestamp)
+	})
+
+	return snapshots, nil
+}
+
 func (h *History) GetPredictionSnapshots(window time.Duration) ([]UtilizationSnapshot, error) {
 	predictionStart := time.Now().Add(-7 * 24 * time.Hour).Add(window).Truncate(10 * time.Second)
 	predictionEnd := predictionStart.Add(window * 10).Truncate(10 * time.Second)
-	h.logger.Info().Str("predictionStart", predictionStart.Format(time.RFC3339)).Msg("Prediction start time")
-	h.logger.Info().Str("predictionEnd", predictionEnd.Format(time.RFC3339)).Msg("Prediction end time")
+
 	input := &dynamodb.QueryInput{
 		TableName:              aws.String(tableName),
 		IndexName:              aws.String("cluster_name-timestamp-index"),

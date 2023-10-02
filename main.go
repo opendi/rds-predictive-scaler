@@ -5,7 +5,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/rs/zerolog/log"
 	"predictive-rds-scaler/api"
-	"predictive-rds-scaler/logutil"
+	"predictive-rds-scaler/logging"
 	"predictive-rds-scaler/scaler"
 	"time"
 )
@@ -30,7 +30,7 @@ func init() {
 }
 
 func main() {
-	logutil.InitLogger()
+	logging.InitLogger()
 
 	awsSession, err := session.NewSessionWithOptions(session.Options{
 		SharedConfigState: session.SharedConfigEnable,
@@ -41,14 +41,15 @@ func main() {
 	}
 
 	// Create the logger
-	logger := logutil.GetLogger()
+	logger := logging.GetLogger()
+	broadcast := make(chan scaler.Broadcast)
 
-	rdsScaler, err := scaler.New(config, logger, awsSession)
+	rdsScaler, err := scaler.New(config, logger, awsSession, broadcast)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Failed to create scaler")
 	}
 
-	apiServer, err := api.New(config, logger, awsSession)
+	apiServer, err := api.New(config, logger, awsSession, broadcast)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Failed to create API server")
 	}
@@ -56,7 +57,7 @@ func main() {
 	defer rdsScaler.Run()
 
 	go func() {
-		err := apiServer.Serve(config.ServerPort)
+		err = apiServer.Serve(config.ServerPort)
 		if err != nil {
 			logger.Fatal().Err(err).Msg("Failed to start API server")
 		}

@@ -15,7 +15,7 @@ import (
 
 const readerNamePrefix = "predictive-autoscaling-"
 
-func New(config Config, logger *zerolog.Logger, awsSession *session.Session) (*Scaler, error) {
+func New(config Config, logger *zerolog.Logger, awsSession *session.Session, broadcast chan Broadcast) (*Scaler, error) {
 	rdsClient := rds.New(awsSession, &aws.Config{
 		Region: aws.String(config.AwsRegion),
 	})
@@ -38,114 +38,170 @@ func New(config Config, logger *zerolog.Logger, awsSession *session.Session) (*S
 		cloudWatchClient: cloudWatchClient,
 		dynamoDbHistory:  dynamoDbHistory,
 		logger:           logger,
+		broadcast:        broadcast,
 	}, nil
 }
 
 func (s *Scaler) Run() {
 	ticker := time.NewTicker(10 * time.Second)
+
 	boostHours, err := parseBoostHours(s.config.BoostHours)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("Error parsing scale out hours")
-		return
 	}
 
-	// Retrieve scale-out and scale-in LastTime values from cluster tags
-	s.scaleOutStatus, err = s.loadCooldownStatus("ScaleOutStatusTimeout")
+	err = s.initCooldownStatus()
 	if err != nil {
-		s.logger.Warn().Err(err).Msg("Error retrieving scale-out LastTime value from cluster tags")
-	}
-
-	s.scaleInStatus, err = s.loadCooldownStatus("ScaleInStatusTimeout")
-	if err != nil {
-		s.logger.Warn().Err(err).Msg("Error retrieving scale-in LastTime value from cluster tags")
+		s.logger.Error().Err(err).Msg("Error initializing cooldown status")
 	}
 
 	for range ticker.C {
-		writerInstance, err := s.getWriterInstance()
-		if err != nil {
-			s.logger.Error().Err(err).Msg("Error getting writer instance")
-			continue
-		}
-
-		readerInstances, currentSize, err := s.getReaderInstances(StatusAll ^ StatusDeleting)
-		if err != nil {
-			s.logger.Error().Err(err).Msg("Error getting reader instances")
-			continue
-		}
-
-		cpuUtilization, err := s.getUtilization(readerInstances, writerInstance)
-		if err != nil {
-			s.logger.Error().Err(err).Msg("Error getting CPU utilization")
-			continue
-		}
-
-		minInstances := s.config.MinInstances
-		if isBoostHour(time.Now().Hour(), boostHours) {
-			minInstances = s.config.MinInstances + s.config.ScaleOutStep
-		}
-
-		s.logger.Info().
-			Str("CPUUtilization", strconv.FormatFloat(cpuUtilization, 'f', 2, 64)).
-			Uint("CurrentReaders", currentSize).
-			Int("ScaleInCooldown", remainingCooldown(s.scaleInStatus.Timeout)).
-			Int("ScaleOutCooldown", remainingCooldown(s.scaleOutStatus.Timeout)).
-			Float64("PlanAheadTime", s.config.PlanAheadTime.Seconds()).
-			Msg("Scaler status")
-
-		if !s.inCooldown(s.scaleInStatus.Timeout) && s.shouldScaleOut(cpuUtilization, currentSize, minInstances) {
-			s.scaleOutStatus.threshold++
-			if s.scaleOutStatus.threshold < 3 {
-				s.logger.Info().Msg("Skipping scale out, threshold not reached")
-				continue
-			}
-			s.scaleOutStatus.threshold = 0
-
-			scaleOutInstances := s.calculateScaleOutReaderCount(currentSize)
-			if scaleOutInstances > 0 {
-				s.logger.Info().Uint("ScaleOutInstances", scaleOutInstances).Msg("Scaling out instances")
-				err := s.scaleOut(readerNamePrefix, scaleOutInstances)
-				if err != nil {
-					s.logger.Error().Err(err).Msg("Error scaling out")
-				} else {
-					err = s.setCooldownStatus(30*time.Second, s.config.ScaleOutCooldown)
-					if err != nil {
-						s.logger.Error().Err(err).Msg("Error setting cooldown status")
-					}
-				}
-			} else {
-				s.logger.Info().Msg("Max instances reached. Cannot scale out.")
-			}
-		} else {
-			s.scaleOutStatus.threshold = 0
-		}
-
-		if !s.inCooldown(s.scaleOutStatus.Timeout) && s.shouldScaleIn(cpuUtilization, currentSize, minInstances) {
-			s.scaleInStatus.threshold++
-			if s.scaleInStatus.threshold < 3 {
-				s.logger.Info().Msg("Skipping scale in, threshold not reached")
-				continue
-			}
-			s.scaleInStatus.threshold = 0
-
-			scaleInInstances := s.calculateScaleInReaderCount(currentSize, minInstances)
-			if scaleInInstances > 0 {
-				s.logger.Info().Uint("ScaleInInstances", scaleInInstances).Msg("Scaling in instances")
-				err := s.scaleIn(scaleInInstances)
-				if err != nil {
-					s.logger.Error().Err(err).Msg("Error scaling in")
-				} else {
-					err = s.setCooldownStatus(s.config.ScaleInCooldown, 60*time.Second)
-					if err != nil {
-						s.logger.Error().Err(err).Msg("Error setting cooldown status")
-					}
-				}
-			} else {
-				s.logger.Info().Msg("Min instances reached. Cannot scale in.")
-			}
-		} else {
-			s.scaleInStatus.threshold = 0
-		}
+		s.processScaling(boostHours)
 	}
+}
+
+func (s *Scaler) initCooldownStatus() error {
+	err := s.loadAndSetCooldownStatus("ScaleOutStatusTimeout", &s.scaleOutStatus)
+	if err != nil {
+		return err
+	}
+
+	err = s.loadAndSetCooldownStatus("ScaleInStatusTimeout", &s.scaleInStatus)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Scaler) loadAndSetCooldownStatus(tagName string, cooldownStatus *Cooldown) error {
+	status, err := s.loadCooldownStatus(tagName)
+	if err != nil {
+		return err
+	}
+
+	*cooldownStatus = status
+	return nil
+}
+
+func (s *Scaler) processScaling(boostHours []int) {
+	writerInstance, err := s.getWriterInstance()
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Error getting writer instance")
+		return
+	}
+
+	readerInstances, currentSize, err := s.getReaderInstances(StatusAll ^ StatusDeleting)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Error getting reader instances")
+		return
+	}
+
+	cpuUtilization, err := s.getUtilization(readerInstances, writerInstance)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Error getting CPU utilization")
+		return
+	}
+
+	minInstances := s.config.MinInstances
+	if isBoostHour(time.Now().Hour(), boostHours) {
+		minInstances = s.config.MinInstances + s.config.ScaleOutStep
+	}
+
+	s.logScalerStatus(cpuUtilization, currentSize)
+
+	if s.inCooldown(s.scaleInStatus.Timeout) {
+		s.submitBroadcast(&Broadcast{"scaleInStatus", s.scaleInStatus})
+	}
+
+	if s.inCooldown(s.scaleOutStatus.Timeout) {
+		s.submitBroadcast(&Broadcast{"scaleOutStatus", s.scaleOutStatus})
+	}
+
+	s.handleScaleOut(cpuUtilization, currentSize, minInstances)
+	s.handleScaleIn(cpuUtilization, currentSize, minInstances)
+}
+
+func (s *Scaler) logScalerStatus(cpuUtilization float64, currentSize uint) {
+	s.logger.Info().
+		Str("CPUUtilization", strconv.FormatFloat(cpuUtilization, 'f', 2, 64)).
+		Uint("CurrentReaders", currentSize).
+		Int("ScaleInCooldown", remainingCooldown(s.scaleInStatus.Timeout)).
+		Int("ScaleOutCooldown", remainingCooldown(s.scaleOutStatus.Timeout)).
+		Float64("PlanAheadTime", s.config.PlanAheadTime.Seconds()).
+		Msg("Scaler status")
+}
+
+func (s *Scaler) handleScaleOut(cpuUtilization float64, currentSize, minInstances uint) {
+	if currentSize < minInstances {
+		s.logger.Info().
+			Uint("Actual", currentSize).
+			Uint("Desired", minInstances).
+			Msg("Should scale out, currently below minimum instances")
+		return
+	}
+
+	if cpuUtilization > s.config.TargetCpuUtil && currentSize < s.config.MaxInstances {
+		if s.scaleOutStatus.threshold < 3 {
+			s.logger.Info().Msg("Skipping scale out, threshold not reached")
+			s.scaleOutStatus.threshold++
+			return
+		}
+		s.scaleOutStatus.threshold = 0
+
+		scaleOutInstances := s.calculateScaleOutReaderCount(currentSize)
+		if scaleOutInstances > 0 {
+			s.logger.Info().Uint("ScaleOutInstances", scaleOutInstances).Msg("Scaling out instances")
+			err := s.scaleOut(readerNamePrefix, scaleOutInstances)
+			if err != nil {
+				s.logger.Error().Err(err).Msg("Error scaling out")
+			} else {
+				s.scaleOutStatus.LastScale = time.Now()
+				err = s.setCooldownStatus(30*time.Second, s.config.ScaleOutCooldown)
+				if err != nil {
+					s.logger.Error().Err(err).Msg("Error setting cooldown status")
+				}
+			}
+		} else {
+			s.logger.Info().Msg("Max instances reached. Cannot scale out.")
+		}
+	} else {
+		s.scaleOutStatus.threshold = 0
+	}
+}
+
+func (s *Scaler) handleScaleIn(cpuUtilization float64, currentSize, minInstances uint) {
+	if !s.inCooldown(s.scaleInStatus.Timeout) && s.shouldScaleIn(cpuUtilization, currentSize, minInstances) {
+		if s.scaleInStatus.threshold < 3 {
+			s.logger.Info().Msg("Skipping scale in, threshold not reached")
+			s.scaleInStatus.threshold++
+			return
+		}
+		s.scaleInStatus.threshold = 0
+
+		scaleInInstances := s.calculateScaleInReaderCount(currentSize, minInstances)
+		if scaleInInstances > 0 {
+			s.logger.Info().Uint("ScaleInInstances", scaleInInstances).Msg("Scaling in instances")
+			err := s.scaleIn(scaleInInstances)
+			if err != nil {
+				s.logger.Error().Err(err).Msg("Error scaling in")
+			} else {
+				s.scaleInStatus.LastScale = time.Now()
+				err = s.setCooldownStatus(s.config.ScaleInCooldown, 60*time.Second)
+				if err != nil {
+					s.logger.Error().Err(err).Msg("Error setting cooldown status")
+				}
+			}
+		} else {
+			s.logger.Info().Msg("Min instances reached. Cannot scale in.")
+		}
+	} else {
+		s.scaleInStatus.threshold = 0
+	}
+}
+
+func (s *Scaler) Shutdown() {
+	close(s.broadcast)
 }
 
 func remainingCooldown(timeout time.Time) int {
@@ -159,10 +215,17 @@ func remainingCooldown(timeout time.Time) int {
 func (s *Scaler) getUtilization(readerInstances []*rds.DBInstance, writerInstance *rds.DBInstance) (float64, error) {
 	historicQueryTime := time.Now().
 		Add(-time.Hour * 24 * 7).
-		Add(s.config.PlanAheadTime) // last week, 10 minutes into the future
-	historicCpuUtilization, historicReaderCount, err := s.dynamoDbHistory.GetValue(historicQueryTime)
+		Add(s.config.PlanAheadTime).
+		Truncate(10 * time.Second)
+
+	prediction, err := s.dynamoDbHistory.GetValue(historicQueryTime)
 	if err != nil {
 		return 0, fmt.Errorf("error getting historic value: %v", err)
+	}
+	if prediction != nil {
+		s.submitBroadcast(&Broadcast{"prediction", prediction})
+	} else {
+		s.logger.Warn().Msg("No historic value found")
 	}
 
 	currentCpuUtilization, currentActiveReaderCount, err := s.getMaxCPUUtilization(readerInstances, writerInstance)
@@ -172,12 +235,12 @@ func (s *Scaler) getUtilization(readerInstances []*rds.DBInstance, writerInstanc
 
 	// If a historic value was found, use it to predict the current CPU utilization
 	predictedValue := false
-	if historicCpuUtilization > 0 {
+	if prediction != nil && prediction.MaxCpuUtilization > 0 {
 		// how high would the historic CPU utilization be with the current reader count?
-		predictedCpuUtilization := historicCpuUtilization * (float64(historicReaderCount+1) / float64(currentActiveReaderCount+1))
+		predictedCpuUtilization := prediction.MaxCpuUtilization * (float64(prediction.NumReaders+1) / float64(currentActiveReaderCount+1))
 		s.logger.Info().
-			Float64("HistoricCpuUtilization", historicCpuUtilization).
-			Uint("HistoricReaderCount", historicReaderCount).
+			Float64("HistoricCpuUtilization", prediction.MaxCpuUtilization).
+			Uint("HistoricReaderCount", prediction.NumReaders).
 			Float64("PredictedCpuUtilization", predictedCpuUtilization).
 			Float64("CurrentCPUUtilization", currentCpuUtilization).
 			Msg("Historic value found.")
@@ -188,14 +251,39 @@ func (s *Scaler) getUtilization(readerInstances []*rds.DBInstance, writerInstanc
 		predictedValue = true
 	}
 
+	snapshot := history.UtilizationSnapshot{
+		Timestamp:         time.Now().Truncate(10 * time.Second),
+		ClusterName:       s.config.RdsClusterName,
+		NumReaders:        currentActiveReaderCount,
+		MaxCpuUtilization: currentCpuUtilization,
+		PredictedValue:    predictedValue,
+		TTL:               time.Now().Add(8 * 24 * time.Hour).Unix(),
+	}
+
 	// Save the item to DynamoDB when scaling is required
-	if err := s.dynamoDbHistory.SaveItem(currentActiveReaderCount, currentCpuUtilization, predictedValue); err != nil {
+	if err = s.dynamoDbHistory.SaveItem(&snapshot); err != nil {
 		return 0, fmt.Errorf("error saving item to DynamoDB: %v", err)
 	}
+
+	s.submitBroadcast(&Broadcast{"snapshot", snapshot})
+
 	return currentCpuUtilization, nil
 }
 
+func (s *Scaler) submitBroadcast(broadcast *Broadcast) {
+	if broadcast.Data != nil {
+		go func() {
+			s.broadcast <- *broadcast
+		}()
+	}
+}
+
 func (s *Scaler) scaleOut(readerNamePrefix string, numInstances uint) error {
+	s.scaleOutStatus.IsScaling = true
+	defer func() {
+		s.scaleOutStatus.IsScaling = false
+	}()
+
 	currentHour := time.Now().Hour()
 	newReaderInstanceNames := make([]string, numInstances)
 
@@ -256,27 +344,32 @@ func (s *Scaler) scaleOut(readerNamePrefix string, numInstances uint) error {
 		newReaderInstanceNames[i] = readerName
 	}
 
-	// Wait for all new reader instances to become "Available"
-	s.logger.Info().Msg("Waiting for all new reader instances to become 'Available'...")
-	scaleStartTime := time.Now()
-	err = s.waitForInstancesAvailable(newReaderInstanceNames)
-	if err != nil {
-		return fmt.Errorf("failed to wait for the new reader instances to become 'Available': %v", err)
-	}
+	go func() {
+		start := time.Now()
+		err := s.waitForInstancesAvailable(newReaderInstanceNames)
+		elapsed := time.Since(start)
 
-	scaleTime := time.Since(scaleStartTime)
-	if adjustedTime := scaleTime + 60*time.Second; adjustedTime > s.config.PlanAheadTime {
-		s.config.PlanAheadTime = adjustedTime
-	}
+		if err != nil {
+			s.logger.Error().Err(err).Msg("Error waiting for instances to become 'Available'")
+			return
+		}
 
-	s.logger.Info().
-		Dur("ScaleTime", scaleTime).
-		Msg("All new reader instances are now 'Available'. Continuing...")
+		// Adjust PlanAheadTime if elapsed time + buffer is greater
+		if adjustedTime := elapsed + 60*time.Second; adjustedTime > s.config.PlanAheadTime {
+			s.config.PlanAheadTime = adjustedTime
+			s.logger.Info().Dur("AdjustedPlanAheadTime", s.config.PlanAheadTime).Msg("PlanAheadTime adjusted")
+		}
+	}()
 
 	return nil
 }
 
 func (s *Scaler) scaleIn(numInstances uint) error {
+	s.scaleInStatus.IsScaling = true
+	defer func() {
+		// Reset the isScaling flag
+		s.scaleInStatus.IsScaling = false
+	}()
 	readerInstances, _, err := s.getReaderInstances(StatusAll)
 	if err != nil {
 		return fmt.Errorf("failed to get reader instances: %v", err)
@@ -321,13 +414,6 @@ func (s *Scaler) scaleIn(numInstances uint) error {
 		}
 		s.logger.Info().Str("InstanceIdentifier", *instance.DBInstanceIdentifier).Str("InstanceStatus", *instance.DBInstanceStatus).Msg("Instance is deleting")
 
-		/*err = s.waitUntilInstanceIsDeleted(*instance.DBInstanceIdentifier)
-		if err != nil {
-			return fmt.Errorf("error while waiting for reader instance deletion: %v", err)
-		}*/
-
-		s.logger.Info().Str("InstanceID", *instance.DBInstanceIdentifier).Msg("Scale-In operation successful")
-
 		// Remove the scaled-in instance from the list
 		readerInstances = readerInstances[1:]
 	}
@@ -337,6 +423,11 @@ func (s *Scaler) scaleIn(numInstances uint) error {
 
 // shouldScaleOut returns true if scaling out is needed based on the current CPU utilization and the maximum number of instances.
 func (s *Scaler) shouldScaleOut(cpuUtilization float64, currentSize, minInstances uint) bool {
+	if s.scaleOutStatus.IsScaling {
+		s.logger.Info().Msg("Skipping scale out: Scaling operation already in progress")
+		return false
+	}
+
 	if currentSize < minInstances {
 		s.logger.Info().
 			Uint("Actual", currentSize).
@@ -365,6 +456,11 @@ func (s *Scaler) calculateScaleOutReaderCount(currentSize uint) uint {
 
 // shouldScaleIn returns true if scaling in is needed based on the current CPU utilization and the minimum number of instances.
 func (s *Scaler) shouldScaleIn(currentCpuUtilization float64, currentSize, minInstances uint) bool {
+	if s.scaleInStatus.IsScaling {
+		s.logger.Info().Msg("Skipping scale in: Scaling operation already in progress")
+		return false
+	}
+
 	if currentCpuUtilization > s.config.TargetCpuUtil {
 		return false
 	}

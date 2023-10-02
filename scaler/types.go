@@ -32,9 +32,17 @@ type Scaler struct {
 	cloudWatchClient *cloudwatch.CloudWatch
 	dynamoDbHistory  *history.History
 	logger           *zerolog.Logger
+	broadcast        chan Broadcast
 }
 
 type Cooldown struct {
-	Timeout   time.Time
+	LastScale time.Time `json:"last_scale"`
+	Timeout   time.Time `json:"timeout"`
+	IsScaling bool      `json:"is_scaling"`
 	threshold uint
+}
+
+type Broadcast struct {
+	MessageType string      `json:"type"`
+	Data        interface{} `json:"data"`
 }

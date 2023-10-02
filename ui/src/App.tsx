@@ -1,32 +1,27 @@
 import React, {useEffect, useState} from 'react';
-import {Bar, CartesianGrid, Cell, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis} from 'recharts';
+import useWebSocket from 'react-use-websocket';
+import Snapshot from './types/Snapshot';
+import Broadcast from "./types/Broadcast";
 import {
-    Backdrop,
-    Box, Chip,
-    CircularProgress,
+    Box,
+    Chip,
     Container,
     createTheme,
     CssBaseline,
-    LinearProgress,
+    IconButton,
     Paper,
-    Theme,
     ThemeProvider,
     Typography
-} from '@mui/material';
-
-import '@fontsource/lato/300.css';
-import '@fontsource/lato/400.css';
-import '@fontsource/lato/700.css';
-
-interface Snapshot {
-    timestamp: string;
-    max_cpu_utilization: number;
-    num_readers: number;
-    cluster_utilization: number;
-    predicted_value: boolean;
-    future_value: boolean;
-    cluster_name: string;
-}
+} from "@mui/material";
+import Loading from "./components/Loading";
+import CurrentLoad from "./components/CurrentLoad";
+import CurrentSize from "./components/CurrentSize";
+import GraphUtilization from "./components/GraphUtilization";
+import GraphClusterSize from "./components/GraphClusterSize";
+import ScaleStatus from "./types/ScaleStatus";
+import CooldownVisualizer from "./components/CooldownVisualizer";
+import SettingsModal from "./components/SettingsModal";
+import SettingsIcon from '@mui/icons-material/Settings';
 
 const theme = createTheme({
     palette: {
@@ -37,21 +32,104 @@ const theme = createTheme({
     }
 });
 
-async function fetchData(start: string, signal: AbortSignal): Promise<Snapshot[]> {
-    try {
-        const url = (process.env.NODE_ENV === 'development' ? 'http://localhost:8041/' : '') + `snapshots?start=${encodeURIComponent(start)}`;
-        const response = await fetch(url, {signal});
-        const snapshots: Snapshot[] = await response.json();
+function App() {
+    const socketUrl =
+        'ws://' +
+        (process.env.NODE_ENV === 'development'
+            ? 'localhost:8041/'
+            : 'localhost:8001/api/v1/namespaces/kube-system/services/http:rds-predictive-scaler:http/proxy/') +
+        'ws';
 
-        return snapshots.map((snapshot) => ({
-            ...snapshot,
-            num_readers: snapshot.num_readers + 1,
-            cluster_utilization: snapshot.max_cpu_utilization * (snapshot.num_readers + 1),
-        }));
-    } catch (error) {
-        console.error('Error fetching data:', error);
-        return [];
-    }
+    const {lastJsonMessage} = useWebSocket(socketUrl, {
+        onOpen: () => console.log('websocket connection established'),
+        shouldReconnect: () => true,
+    });
+
+    const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
+    const [currentSnapshot, setCurrentSnapshot] = useState<Snapshot | null>(null);
+    const [predictions, setPredictions] = useState<Snapshot[]>([]);
+    const [currentPrediction, setCurrentPrediction] = useState<Snapshot | null>(null);
+    const [scaleOutStatus, setScaleOutStatus] = useState<ScaleStatus | null>(null);
+    const [scaleInStatus, setScaleInStatus] = useState<ScaleStatus | null>(null);
+    const [isSettingsModalOpen, setSettingsModalOpen] = useState(false);
+
+    useEffect(() => {
+        if (lastJsonMessage == null) return;
+        const broadcast = lastJsonMessage as any as Broadcast;
+        switch (broadcast.type) {
+            case 'scaleOutStatus':
+                const scaleOutStatus = broadcast.data as ScaleStatus;
+                setScaleOutStatus(scaleOutStatus);
+                break;
+            case 'scaleInStatus':
+                const scaleInStatus = broadcast.data as ScaleStatus;
+                setScaleOutStatus(scaleInStatus);
+                break;
+            case 'snapshot':
+                const snapshot = broadcast.data as Snapshot;
+                snapshot.num_readers += 1;
+                snapshot.cluster_utilization = snapshot.max_cpu_utilization * snapshot.num_readers;
+                setSnapshots((snapshots) => [...snapshots.slice(1), snapshot]);
+                setCurrentSnapshot(snapshot);
+                break;
+            case 'prediction':
+                const prediction = broadcast.data as Snapshot;
+                prediction.num_readers += 1;
+                prediction.cluster_utilization = prediction.max_cpu_utilization * prediction.num_readers;
+                setPredictions((predictions) => [...predictions.slice(1), prediction]);
+                setCurrentPrediction(prediction);
+                break;
+            case 'snapshots':
+                setSnapshots((broadcast.data as Snapshot[]).map((snapshot: Snapshot) => {
+                    snapshot.num_readers += 1;
+                    snapshot.cluster_utilization = snapshot.max_cpu_utilization * snapshot.num_readers;
+                    return snapshot;
+                }));
+                break;
+
+        }
+    }, [lastJsonMessage]);
+
+    const aggregatedData = groupDataByTime(snapshots, 5 * 60 * 1000, 10 * 1000);
+    const openSettingsModal = () => {
+        setSettingsModalOpen(true);
+    };
+
+    const closeSettingsModal = () => {
+        setSettingsModalOpen(false);
+    };
+
+    return (
+        <ThemeProvider theme={theme}>
+            <CssBaseline/>
+            <Container>
+                {currentSnapshot ? (
+                    <Paper elevation={3} sx={{padding: 2, marginBottom: 3}}>
+                        <Box sx={{width: '100%'}}>
+                            <Typography variant="h4" gutterBottom>
+                                Cluster Status {currentSnapshot && <Chip label={currentSnapshot.cluster_name}/>}
+                                <IconButton onClick={openSettingsModal}><SettingsIcon/></IconButton>
+                                {currentSnapshot && (
+                                    <Box sx={{marginTop: '10px', display: 'flex'}}>
+                                        <CurrentLoad currentSnapshot={currentSnapshot}
+                                                     currentPrediction={currentPrediction}/>
+                                        <CurrentSize currentSnapshot={currentSnapshot}
+                                                     currentPrediction={currentPrediction}/>
+                                        <CooldownVisualizer scaleInStatus={scaleInStatus}
+                                                            scaleOutStatus={scaleOutStatus}/>
+                                    </Box>
+                                )}
+                            </Typography>
+                        </Box>
+                        <GraphUtilization data={aggregatedData}/>
+                        <GraphClusterSize data={aggregatedData}/>
+                    </Paper>
+                ) : <Loading/>}
+                <SettingsModal open={isSettingsModalOpen} onClose={closeSettingsModal} onSave={() => {
+                }}/>
+            </Container>
+        </ThemeProvider>
+    );
 }
 
 function groupDataByTime(data: Snapshot[], timeInterval: number, mostRecentTimeInterval: number): Snapshot[] {
@@ -59,6 +137,7 @@ function groupDataByTime(data: Snapshot[], timeInterval: number, mostRecentTimeI
     let currentGroup: Snapshot | null = null;
     let numReadersSum = 0;
     let clusterUtilizationSum = 0;
+    let maxCpuUtilizationSum = 0;
     let count = 0;
 
     let mostRecentTimestamp = 0;
@@ -71,16 +150,21 @@ function groupDataByTime(data: Snapshot[], timeInterval: number, mostRecentTimeI
 
     data.forEach((snapshot) => {
         const timestamp = new Date(snapshot.timestamp).getTime();
-
         // Determine the appropriate time interval based on the conditions
-        const interval = (!snapshot.future_value && mostRecentTimestamp - timestamp <= 60 * 60 * 1000)
+        const interval = (!snapshot.future_value && mostRecentTimestamp - timestamp <= 15 * 60 * 1000)
             ? mostRecentTimeInterval
             : timeInterval;
 
         if (!currentGroup) {
-            currentGroup = {...snapshot, timestamp: snapshot.timestamp, num_readers: 0, cluster_utilization: 0};
+            currentGroup = {
+                ...snapshot,
+                timestamp: snapshot.timestamp,
+                num_readers: 0,
+                cluster_utilization: 0
+            } as Snapshot;
             numReadersSum = snapshot.num_readers;
             clusterUtilizationSum = snapshot.cluster_utilization;
+            maxCpuUtilizationSum = snapshot.max_cpu_utilization;
             count = 1;
         } else if (timestamp - new Date(currentGroup.timestamp).getTime() >= interval) {
             (currentGroup as Snapshot).num_readers = numReadersSum / count;
@@ -89,10 +173,12 @@ function groupDataByTime(data: Snapshot[], timeInterval: number, mostRecentTimeI
             currentGroup = {...snapshot, timestamp: snapshot.timestamp, num_readers: 0, cluster_utilization: 0};
             numReadersSum = snapshot.num_readers;
             clusterUtilizationSum = snapshot.cluster_utilization;
+            maxCpuUtilizationSum = snapshot.max_cpu_utilization;
             count = 1;
         } else {
             numReadersSum += snapshot.num_readers;
             clusterUtilizationSum += snapshot.cluster_utilization;
+            maxCpuUtilizationSum += snapshot.max_cpu_utilization;
             count++;
         }
     });
@@ -100,252 +186,11 @@ function groupDataByTime(data: Snapshot[], timeInterval: number, mostRecentTimeI
     if (currentGroup) {
         (currentGroup as Snapshot).num_readers = numReadersSum / count;
         (currentGroup as Snapshot).cluster_utilization = clusterUtilizationSum / count;
+        (currentGroup as Snapshot).max_cpu_utilization = maxCpuUtilizationSum / count;
         groupedData.push(currentGroup);
     }
 
     return groupedData;
 }
 
-
-function App() {
-    const [recent, setRecent] = useState<Snapshot[]>([]);
-    const [cursor, setCursor] = useState<string | null>(null);
-    const [fetchController, setFetchController] = useState<AbortController | null>(null);
-    const [currentSnapshot, setCurrentSnapshot] = useState<Snapshot | null>(null);
-    const [currentPrediction, setCurrentPrediction] = useState<Snapshot | null>(null);
-
-    useEffect(() => {
-        async function fetchRecent() {
-            if (fetchController) {
-                fetchController.abort(); // Abort ongoing fetch if exists
-            }
-
-            const controller = new AbortController();
-            setFetchController(controller);
-
-            try {
-                const start: string = new Date().toISOString();
-                const recentData = await fetchData(start, controller.signal);
-                setRecent(recentData);
-            } catch (error) {
-                console.error('Error fetching data:', error)
-            }
-        }
-
-        fetchRecent();
-        const intervalId = setInterval(fetchRecent, 0.5 * 60 * 1000);
-
-        return () => {
-            clearInterval(intervalId); // Clear interval on unmount
-            if (fetchController) {
-                fetchController.abort(); // Abort ongoing fetch on unmount
-            }
-        };
-    }, []);
-
-    useEffect(() => {
-        document.title = 'Predictive RDS Autoscaler ' + (recent.length && recent[0].cluster_name);
-        for (let i = recent.length - 1; i >= 0; i--) {
-            if (!recent[i].future_value) {
-                setCurrentSnapshot(recent[i]);
-                setCurrentPrediction(recent[i + 1]);
-                break;
-            }
-        }
-    }, [recent]);
-
-    const handleMouseMove = (e: any) => {
-        if (e && e.activeLabel) {
-            setCursor(e.activeLabel);
-        }
-    };
-
-    const handleMouseLeave = () => {
-        setCursor(null);
-    };
-
-    const aggregatedData = groupDataByTime(recent, 5 * 60 * 1000, 1 * 60 * 1000);
-    return (
-        <ThemeProvider theme={theme}>
-            <CssBaseline/>
-            <Container>
-                {aggregatedData.length === 0 &&
-                    <Backdrop
-                        sx={{color: '#fff', zIndex: (theme: Theme) => theme.zIndex.drawer + 1}}
-                        open={true}
-                    >
-                        <CircularProgress color="inherit"/>
-                    </Backdrop>}
-
-                {aggregatedData.length > 0 &&
-                    <Paper elevation={3} sx={{padding: 2, marginBottom: 3}}>
-                        <Box sx={{width: '100%'}}>
-                            <Typography variant="h4" gutterBottom>
-                                Cluster Utilization {currentSnapshot && <Chip label={currentSnapshot.cluster_name} />}
-                                {
-                                    currentSnapshot && <><Box sx={{display: 'flex', alignItems: 'center', marginTop: '20px'}}>
-                                        <Box sx={{width: '50%', mr: 1}}>
-                                            <LinearProgress
-                                                variant="buffer"
-                                                color={currentSnapshot.max_cpu_utilization < 50 ? "success" : currentSnapshot.max_cpu_utilization < 75 ? "warning" : "error"}
-                                                value={currentSnapshot.max_cpu_utilization}
-                                                valueBuffer={currentPrediction?.max_cpu_utilization}
-                                            />
-                                        </Box>
-                                        <Box sx={{minWidth: 35}}>
-                                            <Typography color="text.secondary">
-                                                {`${Math.round(currentSnapshot.max_cpu_utilization,)}% Current, `}
-                                                {currentPrediction && `${Math.round(currentPrediction?.max_cpu_utilization,)}% Predicted`}
-                                            </Typography>
-                                        </Box>
-                                    </Box>
-                                        {currentPrediction &&
-                                            <Box sx={{display: 'flex', alignItems: 'center'}}>
-                                                <Box sx={{width: '50%', mr: 1}}>
-                                                    <LinearProgress
-                                                        variant="buffer"
-                                                        value={currentSnapshot.num_readers / 5 * 100}
-                                                        valueBuffer={currentPrediction.num_readers / 5 * 100}
-                                                    />
-                                                </Box>
-                                                <Box sx={{minWidth: 35}}>
-                                                    <Typography
-                                                        color="text.secondary">
-                                                        {currentSnapshot && ` ${Math.round(currentSnapshot?.num_readers,)} Current,`}
-                                                        {currentPrediction && ` ${Math.round(currentPrediction?.num_readers,)} Predicted`}
-                                                    </Typography>
-                                                </Box>
-                                            </Box>
-                                        }
-                                    </>}
-                            </Typography>
-                        </Box>
-                        <ResponsiveContainer width="100%" height={300}>
-                            <ComposedChart
-                                style={{cursor: 'crosshair'}}
-                                data={aggregatedData}
-                                onMouseMove={handleMouseMove}
-                                onMouseLeave={handleMouseLeave}
-
-                            >
-                                <XAxis dataKey="timestamp" tickFormatter={(timeStr) => ''}/>
-                                <YAxis yAxisId="left"/>
-                                <CartesianGrid strokeDasharray="2 1" opacity={0.3}/>
-                                <Tooltip content={<CustomTooltip />} />
-                                <Line
-                                    type="monotone"
-                                    dataKey="cluster_utilization"
-                                    stroke="#82ca9d"
-                                    strokeWidth={2}
-                                    dot={false}
-                                    yAxisId="left"
-                                ></Line>
-                                <Line
-                                    type="monotone"
-                                    dataKey="max_cpu_utilization"
-                                    stroke="#fff"
-                                    strokeWidth={2}
-                                    dot={false}
-                                    yAxisId="left"
-                                />
-                            </ComposedChart>
-                        </ResponsiveContainer>
-                        <ResponsiveContainer width="100%" height={120}>
-                            <ComposedChart
-                                style={{cursor: 'crosshair'}}
-                                data={aggregatedData}
-                                onMouseMove={handleMouseMove}
-                                onMouseLeave={handleMouseLeave}
-
-                            >
-                                <XAxis dataKey="timestamp" tickFormatter={(timeStr) => timeStr.slice(11, 16)}/>
-                                <YAxis/>
-                                <Bar dataKey="num_readers"
-                                     barSize={20}
-                                     style={{transition: 'fill 0.3s'}}
-                                >
-                                    {aggregatedData.map((snapshot: Snapshot, index) => (
-                                        <Cell key={index}
-                                              fill={snapshot.future_value ? 'rgb(171,35,35)' : snapshot.predicted_value ? 'rgb(0,162,191)' : 'rgb(140,140,140)'}
-                                        />
-                                    ))}
-                                </Bar>
-                            </ComposedChart>
-                        </ResponsiveContainer>
-                    </Paper>
-                }
-
-                {
-                    cursor && (
-                        <Paper elevation={3} sx={{padding: 2, marginTop: 3}}>
-                            <Typography variant="h6">Cursor Details</Typography>
-                            {recent.some((item) => item.timestamp === cursor) ? (
-                                <>
-                                    {recent.map((item) => {
-                                        if (item.timestamp === cursor) {
-                                            const {
-                                                num_readers,
-                                                cluster_utilization,
-                                                max_cpu_utilization,
-                                                predicted_value,
-                                                future_value
-                                            } = item;
-                                            return (
-                                                <div key={item.timestamp}>
-                                                    <Typography>Timestamp: {cursor}</Typography>
-                                                    <Typography>Cluster Size: {num_readers}</Typography>
-                                                    <Typography>Cluster
-                                                        Utilization: {cluster_utilization.toPrecision(4)}%</Typography>
-                                                    <Typography>Max
-                                                        Utilization: {max_cpu_utilization.toPrecision(4)}%</Typography>
-                                                    <Typography>
-                                                        {future_value && "Forecasted value"}
-                                                        {predicted_value && "Historic value used for scaling"}
-                                                    </Typography>
-                                                </div>
-                                            );
-                                        }
-                                        return null;
-                                    })}
-                                </>
-                            ) : (
-                                <Typography>No details available for this timestamp.</Typography>
-                            )}
-                        </Paper>
-                    )
-                }
-            </Container>
-        </ThemeProvider>
-    )
-        ;
-}
-
 export default App;
-
-const CustomTooltip = ({ active, payload, label }: any) => {
-    if (active && payload && payload.length) {
-        const item = payload[0].payload;
-        const {
-            num_readers,
-            cluster_utilization,
-            max_cpu_utilization,
-            predicted_value,
-            future_value
-        } = item;
-
-        return (
-            <Box>
-                {/*<Typography variant="body2">Timestamp: {label}</Typography>
-                <Typography variant="body2">Cluster Size: {num_readers}</Typography>
-                <Typography variant="body2">Cluster Utilization: {cluster_utilization.toPrecision(4)}%</Typography>
-                <Typography variant="body2">Max Utilization: {max_cpu_utilization.toPrecision(4)}%</Typography>
-                <Typography variant="body2">
-                    {future_value && "Forecasted value"}
-                    {predicted_value && "Historic value used for scaling"}
-                </Typography>*/}
-            </Box>
-        );
-    }
-
-    return null;
-};
