@@ -1,4 +1,3 @@
-import React from "react";
 import {Box, Card, LinearProgress, Typography} from "@mui/material";
 import Snapshot from "../types/Snapshot";
 

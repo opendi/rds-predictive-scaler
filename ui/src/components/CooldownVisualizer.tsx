@@ -1,5 +1,5 @@
 import React from 'react';
-import { Card, CardContent, Typography } from '@mui/material';
+import { Card, Typography } from '@mui/material';
 import AnimatedIcon from './AnimatedIcon';
 import ScaleStatus from "../types/ScaleStatus";
 
