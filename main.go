@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"os"
 	"os/signal"
@@ -36,25 +35,9 @@ func main() {
 	broadcast := make(chan scaler.Broadcast)
 
 	logging.InitLogger(broadcast)
+
 	// Create the logger
 	logger := logging.GetLogger()
-
-	// Create a formatted string containing all argument values
-	argsMessage := "Arguments:\n" +
-		"awsRegion: " + config.AwsRegion + "\n" +
-		"rdsClusterName: " + config.RdsClusterName + "\n" +
-		"minInstances: " + fmt.Sprint(config.MinInstances) + "\n" +
-		"maxInstances: " + fmt.Sprint(config.MaxInstances) + "\n" +
-		"boostHours: " + config.BoostHours + "\n" +
-		"scaleInStep: " + fmt.Sprint(config.ScaleInStep) + "\n" +
-		"scaleOutStep: " + fmt.Sprint(config.ScaleOutStep) + "\n" +
-		"targetCpuUtilization: " + fmt.Sprint(config.TargetCpuUtil) + "\n" +
-		"scaleOutCooldown: " + config.ScaleOutCooldown.String() + "\n" +
-		"scaleInCooldown: " + config.ScaleInCooldown.String() + "\n" +
-		"planAheadTime: " + config.PlanAheadTime.String()
-
-	// Log the argument values in a debug message
-	logger.Debug().Msg(argsMessage)
 
 	awsSession, err := session.NewSessionWithOptions(session.Options{
 		SharedConfigState: session.SharedConfigEnable,
@@ -70,7 +53,6 @@ func main() {
 		logger.Error().Err(err).Msg("Failed to create scaler")
 		return
 	}
-	defer rdsScaler.Run()
 
 	// Create and start the API server
 	apiServer, err := api.New(config, logger, awsSession, broadcast)
@@ -78,6 +60,8 @@ func main() {
 		logger.Error().Err(err).Msg("Failed to create API server")
 		return
 	}
+
+	rdsScaler.Run()
 
 	go func() {
 		err = apiServer.Serve(config.ServerPort)
@@ -95,8 +79,6 @@ func main() {
 
 	// Handle the termination signal by initiating graceful shutdown
 	logger.Info().Msg("Received termination signal. Initiating graceful shutdown...")
-
-	// Perform cleanup operations here, if needed
 
 	// Stop the API server
 	apiServer.Stop()
