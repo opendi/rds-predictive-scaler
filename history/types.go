@@ -12,7 +12,6 @@ type UtilizationSnapshot struct {
 	NumReaders        uint      `json:"num_readers"`
 	MaxCpuUtilization float64   `json:"max_cpu_utilization"`
 	PredictedValue    bool      `json:"predicted_value"`
-	FutureValue       bool      `json:"future_value"`
 	ClusterName       string    `json:"cluster_name"`
 	TTL               int64     `json:"ttl"`
 }

@@ -35,6 +35,18 @@ type Scaler struct {
 	broadcast        chan Broadcast
 }
 
+func (s *Scaler) Stop() {
+	s.logger.Info().Msg("Stopping scaler")
+	close(s.broadcast)
+}
+
+type InstanceStatus struct {
+	Name           string  `json:"name"` // Rename InstanceID to Name and update JSON tag
+	IsWriter       bool    `json:"is_writer"`
+	Status         string  `json:"status"`
+	CPUUtilization float64 `json:"cpu_utilization"`
+}
+
 type Cooldown struct {
 	LastScale time.Time `json:"last_scale"`
 	Timeout   time.Time `json:"timeout"`

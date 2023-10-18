@@ -60,6 +60,10 @@ func (s *Scaler) Run() {
 	}
 }
 
+func (s *Scaler) Shutdown() {
+	close(s.broadcast)
+}
+
 func (s *Scaler) initCooldownStatus() error {
 	err := s.loadAndSetCooldownStatus("ScaleOutStatusTimeout", &s.scaleOutStatus)
 	if err != nil {
@@ -97,7 +101,29 @@ func (s *Scaler) processScaling(boostHours []int) {
 		return
 	}
 
-	cpuUtilization, err := s.getUtilization(readerInstances, writerInstance)
+	clusterStatus := make([]InstanceStatus, 0)
+
+	// Collect information about reader instances
+	for _, instance := range readerInstances {
+		instanceInfo := InstanceStatus{
+			Name:           *instance.DBInstanceIdentifier,
+			IsWriter:       false,
+			Status:         *instance.DBInstanceStatus,
+			CPUUtilization: s.getInstanceUtilization(instance), // Use your existing function to get CPU utilization
+		}
+		clusterStatus = append(clusterStatus, instanceInfo)
+	}
+
+	// Collect information about the writer instance
+	writerStatus := InstanceStatus{
+		Name:           *writerInstance.DBInstanceIdentifier,
+		IsWriter:       true,
+		Status:         *writerInstance.DBInstanceStatus,
+		CPUUtilization: s.getInstanceUtilization(writerInstance), // Use your existing function to get CPU utilization
+	}
+	clusterStatus = append(clusterStatus, writerStatus)
+
+	cpuUtilization, err := s.getUtilizationPrediction(clusterStatus)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("Error getting CPU utilization")
 		return
@@ -109,6 +135,7 @@ func (s *Scaler) processScaling(boostHours []int) {
 	}
 
 	s.logScalerStatus(cpuUtilization, currentSize)
+	s.submitBroadcast(&Broadcast{"clusterStatus", clusterStatus})
 
 	if s.inCooldown(s.scaleInStatus.Timeout) {
 		s.submitBroadcast(&Broadcast{"scaleInStatus", s.scaleInStatus})
@@ -118,8 +145,13 @@ func (s *Scaler) processScaling(boostHours []int) {
 		s.submitBroadcast(&Broadcast{"scaleOutStatus", s.scaleOutStatus})
 	}
 
-	s.handleScaleOut(cpuUtilization, currentSize, minInstances)
-	s.handleScaleIn(cpuUtilization, currentSize, minInstances)
+	if s.shouldScaleOut(cpuUtilization, currentSize, minInstances) {
+		s.handleScaleOut(cpuUtilization, currentSize, minInstances)
+	}
+
+	if s.shouldScaleIn(cpuUtilization, currentSize, minInstances) {
+		s.handleScaleIn(cpuUtilization, currentSize, minInstances)
+	}
 }
 
 func (s *Scaler) logScalerStatus(cpuUtilization float64, currentSize uint) {
@@ -200,10 +232,6 @@ func (s *Scaler) handleScaleIn(cpuUtilization float64, currentSize, minInstances
 	}
 }
 
-func (s *Scaler) Shutdown() {
-	close(s.broadcast)
-}
-
 func remainingCooldown(timeout time.Time) int {
 	remaining := timeout.Sub(time.Now())
 	if remaining < 0 {
@@ -212,7 +240,7 @@ func remainingCooldown(timeout time.Time) int {
 	return int(remaining.Seconds())
 }
 
-func (s *Scaler) getUtilization(readerInstances []*rds.DBInstance, writerInstance *rds.DBInstance) (float64, error) {
+func (s *Scaler) getUtilizationPrediction(instanceStatus []InstanceStatus) (float64, error) {
 	historicQueryTime := time.Now().
 		Add(-time.Hour * 24 * 7).
 		Add(s.config.PlanAheadTime).
@@ -228,7 +256,7 @@ func (s *Scaler) getUtilization(readerInstances []*rds.DBInstance, writerInstanc
 		s.logger.Warn().Msg("No historic value found")
 	}
 
-	currentCpuUtilization, currentActiveReaderCount, err := s.getMaxCPUUtilization(readerInstances, writerInstance)
+	currentCpuUtilization, currentActiveReaderCount, err := s.getMaxCPUUtilization(instanceStatus)
 	if err != nil {
 		return 0, fmt.Errorf("error getting max CPU utilization: %v", err)
 	}
@@ -293,19 +321,22 @@ func (s *Scaler) scaleOut(readerNamePrefix string, numInstances uint) error {
 	}
 
 	if numStartingInstances > 0 {
-		s.logger.Info().Msg("Waiting for starting instances to be ready")
-		instanceIdentifiers := make([]string, len(startingInstances))
-		for i, instance := range startingInstances {
-			instanceIdentifiers[i] = *instance.DBInstanceIdentifier
-		}
+		go func() {
+			s.logger.Info().Msg("Waiting for starting instances to be ready")
+			instanceIdentifiers := make([]string, len(startingInstances))
+			for i, instance := range startingInstances {
+				instanceIdentifiers[i] = *instance.DBInstanceIdentifier
+			}
 
-		err = s.waitForInstancesAvailable(instanceIdentifiers)
-		if err != nil {
-			s.logger.Warn().Err(err).Msg("error waiting for starting instances to be ready")
-		}
-		numInstances -= numStartingInstances
+			err = s.waitForInstancesAvailable(instanceIdentifiers)
+			if err != nil {
+				s.logger.Warn().Err(err).Msg("error waiting for starting instances to be ready")
+			}
+
+		}()
 	}
 
+	numInstances -= numStartingInstances
 	for i := 0; i < int(numInstances); i++ {
 		// Get the current writer instance
 		writerInstance, err := s.getWriterInstance()
@@ -319,21 +350,7 @@ func (s *Scaler) scaleOut(readerNamePrefix string, numInstances uint) error {
 		// Create the reader instance name with the prefix, current scale-out hour, and random UID
 		readerName := fmt.Sprintf("%s%d-%s", readerNamePrefix, currentHour, randomUID)
 
-		// Use the writer instance's configuration as a template for the new reader instance
-		readerDBInstance := &rds.CreateDBInstanceInput{
-			DBInstanceClass:         writerInstance.DBInstanceClass,
-			Engine:                  writerInstance.Engine,
-			DBClusterIdentifier:     aws.String(s.config.RdsClusterName),
-			DBInstanceIdentifier:    aws.String(readerName),
-			PubliclyAccessible:      aws.Bool(false),
-			MultiAZ:                 writerInstance.MultiAZ,
-			CopyTagsToSnapshot:      writerInstance.CopyTagsToSnapshot,
-			AutoMinorVersionUpgrade: writerInstance.AutoMinorVersionUpgrade,
-			DBParameterGroupName:    writerInstance.DBParameterGroups[0].DBParameterGroupName,
-		}
-
-		// Perform the scaling operation to add a reader to the cluster
-		_, err = s.rdsClient.CreateDBInstance(readerDBInstance)
+		_, err = s.createReaderInstance(readerName, writerInstance)
 		if err != nil {
 			return fmt.Errorf("failed to add reader instance: %v", err)
 		}
@@ -428,6 +445,11 @@ func (s *Scaler) shouldScaleOut(cpuUtilization float64, currentSize, minInstance
 		return false
 	}
 
+	if s.inCooldown(s.scaleOutStatus.Timeout) {
+		s.logger.Info().Msg("Skipping scale out: Scale out in cooldown")
+		return false
+	}
+
 	if currentSize < minInstances {
 		s.logger.Info().
 			Uint("Actual", currentSize).
@@ -458,6 +480,11 @@ func (s *Scaler) calculateScaleOutReaderCount(currentSize uint) uint {
 func (s *Scaler) shouldScaleIn(currentCpuUtilization float64, currentSize, minInstances uint) bool {
 	if s.scaleInStatus.IsScaling {
 		s.logger.Info().Msg("Skipping scale in: Scaling operation already in progress")
+		return false
+	}
+
+	if s.inCooldown(s.scaleInStatus.Timeout) {
+		s.logger.Info().Msg("Skipping scale in: Scale in in cooldown")
 		return false
 	}
 

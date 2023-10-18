@@ -2,11 +2,14 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/rs/zerolog/log"
+	"os"
+	"os/signal"
 	"predictive-rds-scaler/api"
 	"predictive-rds-scaler/logging"
 	"predictive-rds-scaler/scaler"
+	"syscall"
 	"time"
 )
 
@@ -30,36 +33,76 @@ func init() {
 }
 
 func main() {
-	logging.InitLogger()
+	broadcast := make(chan scaler.Broadcast)
+
+	logging.InitLogger(broadcast)
+	// Create the logger
+	logger := logging.GetLogger()
+
+	// Create a formatted string containing all argument values
+	argsMessage := "Arguments:\n" +
+		"awsRegion: " + config.AwsRegion + "\n" +
+		"rdsClusterName: " + config.RdsClusterName + "\n" +
+		"minInstances: " + fmt.Sprint(config.MinInstances) + "\n" +
+		"maxInstances: " + fmt.Sprint(config.MaxInstances) + "\n" +
+		"boostHours: " + config.BoostHours + "\n" +
+		"scaleInStep: " + fmt.Sprint(config.ScaleInStep) + "\n" +
+		"scaleOutStep: " + fmt.Sprint(config.ScaleOutStep) + "\n" +
+		"targetCpuUtilization: " + fmt.Sprint(config.TargetCpuUtil) + "\n" +
+		"scaleOutCooldown: " + config.ScaleOutCooldown.String() + "\n" +
+		"scaleInCooldown: " + config.ScaleInCooldown.String() + "\n" +
+		"planAheadTime: " + config.PlanAheadTime.String()
+
+	// Log the argument values in a debug message
+	logger.Debug().Msg(argsMessage)
 
 	awsSession, err := session.NewSessionWithOptions(session.Options{
 		SharedConfigState: session.SharedConfigEnable,
 	})
-
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to create AWS session")
+		logger.Error().Err(err).Msg("Failed to create AWS session")
+		return
 	}
 
-	// Create the logger
-	logger := logging.GetLogger()
-	broadcast := make(chan scaler.Broadcast)
-
+	// Create and start the scaler
 	rdsScaler, err := scaler.New(config, logger, awsSession, broadcast)
 	if err != nil {
-		logger.Fatal().Err(err).Msg("Failed to create scaler")
+		logger.Error().Err(err).Msg("Failed to create scaler")
+		return
 	}
+	defer rdsScaler.Run()
 
+	// Create and start the API server
 	apiServer, err := api.New(config, logger, awsSession, broadcast)
 	if err != nil {
-		logger.Fatal().Err(err).Msg("Failed to create API server")
+		logger.Error().Err(err).Msg("Failed to create API server")
+		return
 	}
-
-	defer rdsScaler.Run()
 
 	go func() {
 		err = apiServer.Serve(config.ServerPort)
 		if err != nil {
-			logger.Fatal().Err(err).Msg("Failed to start API server")
+			logger.Error().Err(err).Msg("Failed to start API server")
 		}
 	}()
+
+	// Set up a channel to capture termination signals
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	// Block until a termination signal is received
+	<-sigCh
+
+	// Handle the termination signal by initiating graceful shutdown
+	logger.Info().Msg("Received termination signal. Initiating graceful shutdown...")
+
+	// Perform cleanup operations here, if needed
+
+	// Stop the API server
+	apiServer.Stop()
+
+	// Stop the scaler
+	rdsScaler.Stop()
+
+	logger.Info().Msg("Shutdown complete. Exiting.")
 }

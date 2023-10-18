@@ -80,6 +80,25 @@ func (s *Scaler) getWriterInstance() (*rds.DBInstance, error) {
 	return nil, fmt.Errorf("writer instance not found in cluster: %s", s.config.RdsClusterName)
 }
 
+func (s *Scaler) createReaderInstance(readerName string, writerInstance *rds.DBInstance) (*rds.CreateDBInstanceOutput, error) {
+	// Use the writer instance's configuration as a template for the new reader instance
+	readerDBInstance := &rds.CreateDBInstanceInput{
+		DBInstanceClass:         writerInstance.DBInstanceClass,
+		Engine:                  writerInstance.Engine,
+		DBClusterIdentifier:     aws.String(s.config.RdsClusterName),
+		DBInstanceIdentifier:    aws.String(readerName),
+		PubliclyAccessible:      aws.Bool(false),
+		MultiAZ:                 writerInstance.MultiAZ,
+		CopyTagsToSnapshot:      writerInstance.CopyTagsToSnapshot,
+		AutoMinorVersionUpgrade: writerInstance.AutoMinorVersionUpgrade,
+		DBParameterGroupName:    writerInstance.DBParameterGroups[0].DBParameterGroupName,
+		CACertificateIdentifier: writerInstance.CACertificateIdentifier,
+	}
+
+	// Perform the scaling operation to add a reader to the cluster
+	return s.rdsClient.CreateDBInstance(readerDBInstance)
+}
+
 func (s *Scaler) getReaderInstances(statusFilter uint64) ([]*rds.DBInstance, uint, error) {
 	describeInput := &rds.DescribeDBInstancesInput{
 		Filters: []*rds.Filter{
@@ -92,12 +111,12 @@ func (s *Scaler) getReaderInstances(statusFilter uint64) ([]*rds.DBInstance, uin
 
 	describeOutput, err := s.rdsClient.DescribeDBInstances(describeInput)
 	if err != nil {
-		return nil, 0, fmt.Errorf("error describing RDS instances", err)
+		return nil, 0, fmt.Errorf("error describing RDS instances: %v", err)
 	}
 
 	writerInstance, err := s.getWriterInstance()
 	if err != nil {
-		return nil, 0, fmt.Errorf("error describing RDS writer instance", err)
+		return nil, 0, fmt.Errorf("error describing RDS writer instance: %v", err)
 	}
 
 	readerInstances := make([]*rds.DBInstance, 0)

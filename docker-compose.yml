@@ -1,0 +1,20 @@
+version: '3'
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - NODE_ENV=development
+    container_name: rds-predictive-scaling
+    ports:
+      - "8041:8041"
+    volumes:
+      - ~/.aws:/root/.aws
+    user: root
+    command: [
+      "./rds-scaler",
+      "--awsRegion=eu-west-1",
+      "--rdsClusterName=aurora-opendi-global-082022-cluster",
+      "--minInstances=0"
+    ]

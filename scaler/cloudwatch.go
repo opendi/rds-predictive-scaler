@@ -13,27 +13,25 @@ import (
 const periodInterval = 300 // 5 minutes interval
 
 // GetMaxCPUUtilization returns the maximum CPU utilization among all RDS instances in the cluster.
-func (s *Scaler) getMaxCPUUtilization(readerInstances []*rds.DBInstance, writerInstance *rds.DBInstance) (float64, uint, error) {
+func (s *Scaler) getMaxCPUUtilization(instanceStatus []InstanceStatus) (float64, uint, error) {
 	maxCPUUtilization := 0.0
 	availableReaderCount := uint(0)
 
-	for _, instance := range readerInstances {
-		cpuUtilization := s.getInstanceUtilization(instance)
-		if *instance.DBInstanceStatus == "available" {
-			maxCPUUtilization = math.Max(maxCPUUtilization, cpuUtilization)
+	for _, status := range instanceStatus {
+		if status.Status != "available" || (status.IsWriter && len(instanceStatus) > 1) {
+			continue // Skip non-available instances and writers if there are other instances
+		}
+
+		maxCPUUtilization = math.Max(maxCPUUtilization, status.CPUUtilization)
+
+		if !status.IsWriter {
 			availableReaderCount++
 		}
 	}
 
-	// Writer instance is always available and also read from
-	// but we can also have pure write pressure so adding readers won't help
-	writerUtilization := s.getInstanceUtilization(writerInstance)
-	if availableReaderCount == 0 || writerUtilization <= 1.3*maxCPUUtilization || writerUtilization > s.config.TargetCpuUtil {
-		s.logger.Info().
-			Float64("MaxCPUUtilization", maxCPUUtilization).
-			Float64("WriterUtilization", writerUtilization).
-			Msg("Adding writer, no active readers or writer isn't 30% over reader utilization")
-		maxCPUUtilization = math.Max(maxCPUUtilization, writerUtilization)
+	// let's not allow 0 because it can only happen when the API returned no data
+	if maxCPUUtilization == 0.0 {
+		maxCPUUtilization = s.config.TargetCpuUtil + 1
 	}
 
 	s.logger.Info().Float64("MaxCPUUtilization", maxCPUUtilization).Msg("Max CPU utilization")

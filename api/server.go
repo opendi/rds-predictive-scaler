@@ -49,14 +49,9 @@ func (api *Server) Serve(port uint) error {
 	r := mux.NewRouter()
 	newConnectionCh := make(chan *websocket.Conn)
 
-	snapshotHistory, err := api.history.GetSnapshotTimeRange(time.Now().Add(-24*time.Hour).Truncate(10*time.Second), time.Now().Truncate(10*time.Second))
-	if err != nil {
-		api.logger.Error().Err(err).Msg("Failed to get snapshotHistory")
-	}
-
 	// Central goroutine to manage connections and broadcasting
 	api.wg.Add(1)
-	go api.manageConnections(newConnectionCh, snapshotHistory)
+	go api.manageConnections(newConnectionCh)
 
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
@@ -79,7 +74,7 @@ func (api *Server) Serve(port uint) error {
 	r.PathPrefix("/").Handler(http.StripPrefix("/", http.FileServer(http.Dir("ui/build"))))
 
 	api.logger.Info().Msgf("Listening on port %d", port)
-	err = http.ListenAndServe(fmt.Sprintf(":%d", port), r)
+	err := http.ListenAndServe(fmt.Sprintf(":%d", port), r)
 	if err != nil {
 		return err
 	}
@@ -92,11 +87,7 @@ func (api *Server) Serve(port uint) error {
 	return nil
 }
 
-func (api *Server) Shutdown() {
-	close(api.shutdownCh)
-}
-
-func (api *Server) manageConnections(newConnectionCh chan *websocket.Conn, snapshotHistory []history.UtilizationSnapshot) {
+func (api *Server) manageConnections(newConnectionCh chan *websocket.Conn) {
 	defer api.wg.Done()
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -120,7 +111,8 @@ func (api *Server) manageConnections(newConnectionCh chan *websocket.Conn, snaps
 		case conn := <-newConnectionCh:
 			api.wsClients[conn] = struct{}{}
 			api.sendConfiguration(conn)
-			api.sendSnapshotHistory(conn, snapshotHistory)
+			api.sendSnapshotHistory(conn)
+			api.sendPredictionHistory(conn)
 
 			go api.handleClientMessages(conn)
 		}
@@ -136,10 +128,38 @@ func (api *Server) cleanupAndReturn() {
 	}
 }
 
-func (api *Server) sendSnapshotHistory(conn *websocket.Conn, snapshotHistory []history.UtilizationSnapshot) {
+func (api *Server) sendSnapshotHistory(conn *websocket.Conn) {
+	snapshotHistory, err := api.history.GetSnapshotTimeRange(time.Now().Add(-24*time.Hour).Truncate(10*time.Second), time.Now().Truncate(10*time.Second))
+	if err != nil {
+		api.logger.Error().Err(err).Msg("Failed to get snapshotHistory")
+		return
+	}
+
 	jsonData, err := json.Marshal(scaler.Broadcast{MessageType: "snapshots", Data: snapshotHistory})
 	if err != nil {
 		api.logger.Error().Err(err).Msg("Error marshaling snapshotHistory")
+		return
+	}
+	api.broadcastData(jsonData, conn)
+}
+
+func (api *Server) sendPredictionHistory(conn *websocket.Conn) {
+	previousWeekStart := time.Now().Add(-7 * 24 * time.Hour).Add(-24 * time.Hour).Add(api.config.PlanAheadTime * time.Second).Truncate(10 * time.Second)
+	previousWeekEnd := previousWeekStart.Add(24 * time.Hour)
+	predictionHistory, err := api.history.GetSnapshotTimeRange(previousWeekStart, previousWeekEnd)
+
+	if err != nil {
+		api.logger.Error().Err(err).Msg("Failed to get predictionHistory")
+		return
+	}
+
+	for i := range predictionHistory {
+		predictionHistory[i].Timestamp = predictionHistory[i].Timestamp.Add(7 * 24 * time.Hour).Add(-api.config.PlanAheadTime * time.Second).Truncate(10 * time.Second)
+	}
+
+	jsonData, err := json.Marshal(scaler.Broadcast{MessageType: "predictions", Data: predictionHistory})
+	if err != nil {
+		api.logger.Error().Err(err).Msg("Error marshaling predictionHistory")
 		return
 	}
 	api.broadcastData(jsonData, conn)
@@ -206,4 +226,9 @@ func (api *Server) handleMessage(message []byte) {
 	default:
 		api.logger.Warn().Msg("Received an unsupported message type")
 	}
+}
+
+func (api *Server) Stop() {
+	api.logger.Info().Msg("Stopping API server")
+	close(api.shutdownCh)
 }

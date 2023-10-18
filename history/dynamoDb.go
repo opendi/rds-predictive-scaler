@@ -180,54 +180,6 @@ func (h *History) GetSnapshotTimeRange(start time.Time, end time.Time) ([]Utiliz
 	return snapshots, nil
 }
 
-func (h *History) GetPredictionSnapshots(window time.Duration) ([]UtilizationSnapshot, error) {
-	predictionStart := time.Now().Add(-7 * 24 * time.Hour).Add(window).Truncate(10 * time.Second)
-	predictionEnd := predictionStart.Add(window * 10).Truncate(10 * time.Second)
-
-	input := &dynamodb.QueryInput{
-		TableName:              aws.String(tableName),
-		IndexName:              aws.String("cluster_name-timestamp-index"),
-		KeyConditionExpression: aws.String("cluster_name = :name AND #timestamp BETWEEN :start AND :end"),
-		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
-			":name": {
-				S: aws.String(h.clusterName),
-			},
-			":start": {
-				S: aws.String(predictionStart.Format(time.RFC3339)),
-			},
-			":end": {
-				S: aws.String(predictionEnd.Format(time.RFC3339)),
-			},
-		},
-		ExpressionAttributeNames: map[string]*string{
-			"#timestamp": aws.String("timestamp"),
-		},
-	}
-
-	result, err := h.client.QueryWithContext(h.context, input)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query DynamoDB: %v", err)
-	}
-
-	snapshots := make([]UtilizationSnapshot, len(result.Items))
-	err = dynamodbattribute.UnmarshalListOfMaps(result.Items, &snapshots)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal DynamoDB snapshots: %v", err)
-	}
-
-	for i := range snapshots {
-		snapshots[i].Timestamp = snapshots[i].Timestamp.Add(7 * 24 * time.Hour).Add(-window).Truncate(10 * time.Second)
-		snapshots[i].FutureValue = true
-	}
-
-	// Sort snapshots by timestamp in ascending order
-	sort.Slice(snapshots, func(i, j int) bool {
-		return snapshots[i].Timestamp.Before(snapshots[j].Timestamp)
-	})
-
-	return snapshots, nil
-}
-
 func createTableIfNotExists(ctx context.Context, client *dynamodb.DynamoDB, logger *zerolog.Logger) error {
 	tableName := aws.String(tableName)
 
