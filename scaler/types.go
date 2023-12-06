@@ -2,6 +2,7 @@ package scaler
 
 import (
 	"github.com/rs/zerolog"
+	"math"
 	"time"
 
 	"github.com/aws/aws-sdk-go/service/cloudwatch"
@@ -38,6 +39,12 @@ type Scaler struct {
 func (s *Scaler) Stop() {
 	s.logger.Info().Msg("Stopping scaler")
 	close(s.broadcast)
+}
+
+func (s *Scaler) calculateDesiredClusterSize(utilization float64, currentReaderCount uint, minReaders uint) uint {
+	targetAverageCPUUtilization := s.config.TargetCpuUtil
+	numberOfServers := uint(math.Ceil(utilization * float64(currentReaderCount) / targetAverageCPUUtilization))
+	return max(minReaders, min(numberOfServers, s.config.MaxInstances))
 }
 
 type InstanceStatus struct {

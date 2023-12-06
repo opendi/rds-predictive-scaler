@@ -53,10 +53,7 @@ func (h *History) SaveItem(snapshot *UtilizationSnapshot) error {
 	return nil // Return a pointer to the snapshot
 }
 
-func (h *History) GetValue(lookupTime time.Time) (*UtilizationSnapshot, error) {
-	// Convert to DynamoDB timestamp format (RFC3339)
-	end := lookupTime.Add(9 * time.Second)
-
+func (h *History) GetValue(lookupTime time.Time, window time.Duration) (*UtilizationSnapshot, error) {
 	input := &dynamodb.QueryInput{
 		TableName:              aws.String(tableName),
 		IndexName:              aws.String("cluster_name-timestamp-index"),
@@ -69,14 +66,12 @@ func (h *History) GetValue(lookupTime time.Time) (*UtilizationSnapshot, error) {
 				S: aws.String(lookupTime.Format(time.RFC3339)),
 			},
 			":end": {
-				S: aws.String(end.Format(time.RFC3339)),
+				S: aws.String(lookupTime.Add(window).Format(time.RFC3339)),
 			},
 		},
 		ExpressionAttributeNames: map[string]*string{
 			"#timestamp": aws.String("timestamp"),
 		},
-		ScanIndexForward: aws.Bool(false), // Descending order (newest first)
-		Limit:            aws.Int64(1),    // Fetch only the newest item
 	}
 
 	result, err := h.client.QueryWithContext(h.context, input) // Pass the context here
@@ -84,17 +79,59 @@ func (h *History) GetValue(lookupTime time.Time) (*UtilizationSnapshot, error) {
 		return nil, fmt.Errorf("failed to query DynamoDB: %v", err)
 	}
 
-	if len(result.Items) > 0 {
+	if len(result.Items) == 0 {
+		return nil, fmt.Errorf("no items found")
+	}
+
+	var snapshots []*UtilizationSnapshot
+
+	if len(result.Items) == 0 {
+		return nil, fmt.Errorf("no items found")
+	}
+
+	var cpuUtilizations []float64
+
+	for _, item := range result.Items {
 		snapshot := UtilizationSnapshot{}
-		err := dynamodbattribute.UnmarshalMap(result.Items[0], &snapshot)
+		err := dynamodbattribute.UnmarshalMap(item, &snapshot)
 		if err != nil {
 			return nil, fmt.Errorf("failed to unmarshal DynamoDB snapshot: %v", err)
 		}
-		return &snapshot, nil
+
+		cpuUtilizations = append(cpuUtilizations, snapshot.MaxCpuUtilization)
+		snapshots = append(snapshots, &snapshot)
 	}
 
-	// No value found for the last week, return 0
-	return nil, nil
+	if len(cpuUtilizations) == 0 {
+		return nil, fmt.Errorf("no valid snapshots found")
+	}
+
+	sort.Float64s(cpuUtilizations)
+
+	index := int(0.98 * float64(len(cpuUtilizations)))
+
+	// Find the 98th percentile value
+	var percentileValue float64
+	if index < len(cpuUtilizations)-1 {
+		percentileValue = cpuUtilizations[index] + float64(index%100)/100*(cpuUtilizations[index+1]-cpuUtilizations[index])
+	} else {
+		percentileValue = cpuUtilizations[len(cpuUtilizations)-1]
+	}
+
+	// Find the snapshot corresponding to the percentile value
+	var snapshotWithPercentile *UtilizationSnapshot
+	for _, snap := range snapshots {
+		if snap.MaxCpuUtilization >= percentileValue {
+			snapshotWithPercentile = snap
+			break
+		}
+	}
+
+	if snapshotWithPercentile == nil {
+		return nil, fmt.Errorf("no snapshot found for the percentile value")
+	}
+
+	return snapshotWithPercentile, nil
 }
 
 func (h *History) GetAllSnapshots(start time.Time) ([]UtilizationSnapshot, error) {

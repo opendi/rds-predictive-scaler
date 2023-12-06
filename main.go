@@ -32,9 +32,8 @@ func init() {
 }
 
 func main() {
-	broadcast := make(chan scaler.Broadcast)
 
-	logging.InitLogger(broadcast)
+	logging.InitLogger()
 
 	// Create the logger
 	logger := logging.GetLogger()
@@ -46,6 +45,8 @@ func main() {
 		logger.Error().Err(err).Msg("Failed to create AWS session")
 		return
 	}
+
+	broadcast := make(chan scaler.Broadcast)
 
 	// Create and start the scaler
 	rdsScaler, err := scaler.New(config, logger, awsSession, broadcast)

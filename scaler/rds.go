@@ -128,7 +128,8 @@ func (s *Scaler) getReaderInstances(statusFilter uint64) ([]*rds.DBInstance, uin
 			}
 		}
 	}
-	return readerInstances, uint(len(readerInstances)), nil
+	// reader instances, counting writer in
+	return readerInstances, uint(len(readerInstances)) + 1, nil
 }
 
 func (s *Scaler) waitForInstancesAvailable(instanceIdentifiers []string) error {
