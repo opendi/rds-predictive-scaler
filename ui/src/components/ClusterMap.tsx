@@ -7,15 +7,8 @@ interface ServerStatusMapping {
     [status: string]: { bgcolor: string; color: string };
 }
 
-export interface InstanceStatus {
-    name: string;
-    cpu_utilization: number;
-    status: string;
-    is_writer: boolean;
-}
-
 interface ClusterMapProps {
-    clusterStatus: InstanceStatus[];
+    clusterStatus: ClusterStatus;
 }
 
 const serverStatusMapping: ServerStatusMapping = {
@@ -67,8 +60,7 @@ const ClusterMap: React.FC<ClusterMapProps> = ({clusterStatus}) => {
 
             <Box sx={{ m: 2 }}>
                 <Grid container spacing={2}>
-                    {clusterStatus
-                        .slice()
+                    {clusterStatus.instance_status
                         .sort((a, b) => {
                             return a.is_writer ? -1 : a.status.localeCompare(b.status)
                         }) // sort by writer first, then by status
@@ -91,7 +83,7 @@ const ClusterMap: React.FC<ClusterMapProps> = ({clusterStatus}) => {
                                                     {instanceStatus.is_writer ? 'W' : 'R'}
                                                 </Avatar>
                                             }
-                                            title={instanceStatus.name}
+                                            title={instanceStatus.identifier}
                                             subheader={instanceStatus.status}
                                         />
                                         <CardContent>

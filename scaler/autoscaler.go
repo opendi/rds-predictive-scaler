@@ -1,44 +1,41 @@
 package scaler
 
 import (
-	"context"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/cloudwatch"
 	"github.com/aws/aws-sdk-go/service/rds"
 	"github.com/rs/zerolog"
-	"predictive-rds-scaler/history"
+	"math"
+	"predictive-rds-scaler/metrics"
+	"predictive-rds-scaler/types"
 	"strconv"
 	"time"
 )
 
-const readerNamePrefix = "predictive-autoscaling-"
+type Scaler struct {
+	config       *types.Config
+	scalerStatus types.Cooldown
+	rdsClient    *rds.RDS
+	logger       *zerolog.Logger
+	broadcast    chan types.Broadcast
+	metrics      *metrics.Metrics
+}
 
-func New(config Config, logger *zerolog.Logger, awsSession *session.Session, broadcast chan Broadcast) (*Scaler, error) {
+func New(conf *types.Config, logger *zerolog.Logger, awsSession *session.Session, broadcast chan types.Broadcast) (*Scaler, error) {
 	rdsClient := rds.New(awsSession, &aws.Config{
-		Region: aws.String(config.AwsRegion),
+		Region: aws.String(conf.AwsRegion),
 	})
 
-	cloudWatchClient := cloudwatch.New(awsSession, &aws.Config{
-		Region: aws.String(config.AwsRegion),
-	})
-
-	ctx := context.Background()
-	dynamoDbHistory, err := history.New(ctx, logger, awsSession, config.AwsRegion, config.RdsClusterName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create DynamoDB history: %v", err)
-	}
+	cloudwatchMetrics := metrics.New(*conf, logger, awsSession)
 
 	return &Scaler{
-		config:           config,
-		scaleOutStatus:   Cooldown{threshold: 0},
-		scaleInStatus:    Cooldown{threshold: 0},
-		rdsClient:        rdsClient,
-		cloudWatchClient: cloudWatchClient,
-		dynamoDbHistory:  dynamoDbHistory,
-		logger:           logger,
-		broadcast:        broadcast,
+		config:       conf,
+		scalerStatus: types.Cooldown{Threshold: 0},
+		rdsClient:    rdsClient,
+		metrics:      cloudwatchMetrics,
+		logger:       logger,
+		broadcast:    broadcast,
 	}, nil
 }
 
@@ -51,7 +48,7 @@ func (s *Scaler) Run() {
 	}
 
 	for range ticker.C {
-		s.processScaling(boostHours)
+		s.scale(boostHours)
 	}
 }
 
@@ -59,96 +56,190 @@ func (s *Scaler) Shutdown() {
 	close(s.broadcast)
 }
 
-func (s *Scaler) processScaling(boostHours []int) {
-	writerInstance, err := s.getWriterInstance()
+func (s *Scaler) scale(boostHours []int) {
+	// determine current status
+	clusterStatus, err := s.getClusterStatus()
 	if err != nil {
-		s.logger.Error().Err(err).Msg("Error getting writer instance")
+		s.logger.Error().Err(err).Msg("Error getting cluster status")
 		return
 	}
 
-	readerInstances, currentSize, err := s.getReaderInstances(StatusAll ^ StatusDeleting)
+	s.logger.Info().
+		Str("AverageCPUUtilization", strconv.FormatFloat(clusterStatus.AverageCPUUtilization, 'f', 2, 64)).
+		Uint("CurrentActiveReaders", clusterStatus.CurrentActiveReaders).
+		Uint("OptimalSize", clusterStatus.OptimalSize).
+		Msg("Cluster status")
+
+	// broadcast current status for UI
+	s.submitBroadcast(&types.Broadcast{MessageType: "clusterStatus", Data: clusterStatus})
+
+	// receive historical data
+	historicStatus, err := s.metrics.GetHistoricClusterStatus(s.config.PlanAheadTime)
 	if err != nil {
-		s.logger.Error().Err(err).Msg("Error getting reader instances")
+		s.logger.Error().Err(err).Msg("Error getting historic cluster status")
 		return
 	}
 
-	clusterStatus := make([]InstanceStatus, 0)
+	s.logger.Info().
+		Str("AverageCPUUtilization", strconv.FormatFloat(historicStatus.AverageCPUUtilization, 'f', 2, 64)).
+		Uint("CurrentActiveReaders", historicStatus.CurrentActiveReaders).
+		Uint("OptimalSize", historicStatus.OptimalSize).
+		Msg("Historic status")
 
-	// Collect information about reader instances
-	for _, instance := range readerInstances {
-		instanceInfo := InstanceStatus{
-			Name:           *instance.DBInstanceIdentifier,
-			IsWriter:       false,
-			Status:         *instance.DBInstanceStatus,
-			CPUUtilization: s.getInstanceUtilization(instance),
-		}
-		clusterStatus = append(clusterStatus, instanceInfo)
-	}
-
-	// Collect information about the writer instance
-	writerStatus := InstanceStatus{
-		Name:           *writerInstance.DBInstanceIdentifier,
-		IsWriter:       true,
-		Status:         *writerInstance.DBInstanceStatus,
-		CPUUtilization: s.getInstanceUtilization(writerInstance),
-	}
-	clusterStatus = append(clusterStatus, writerStatus)
-
-	prediction, err := s.getUtilizationPrediction(clusterStatus)
-	if err != nil {
-		s.logger.Error().Err(err).Msg("Error getting CPU utilization")
-		return
-	}
+	s.submitBroadcast(&types.Broadcast{MessageType: "clusterStatusPrediction", Data: historicStatus})
 
 	minInstances := s.config.MinInstances
-	if isBoostHour(time.Now().Hour(), boostHours) {
-		minInstances = s.config.MinInstances + s.config.ScaleOutStep
+	if isBoostHour(time.Now().In(time.UTC).Hour(), boostHours) {
+		minInstances = s.config.MinInstances + 1
 	}
+	maxOptimalSize := math.Max(float64(clusterStatus.OptimalSize), float64(historicStatus.OptimalSize))
+	maxWithMinInstances := math.Max(float64(minInstances), maxOptimalSize)
+	predictedOptimalSizeFloat := math.Min(float64(s.config.MaxInstances), maxWithMinInstances)
+	predictedOptimalSize := uint(predictedOptimalSizeFloat)
 
-	s.submitBroadcast(&Broadcast{"clusterStatus", clusterStatus})
-
-	desiredClusterSize := s.calculateDesiredClusterSize(prediction.MaxCpuUtilization, prediction.NumReaders, minInstances)
-
-	if desiredClusterSize == currentSize {
+	if predictedOptimalSize == clusterStatus.CurrentActiveReaders {
 		s.logger.Info().
-			Uint("Actual", currentSize).
-			Uint("Desired", desiredClusterSize).
+			Uint("Actual", clusterStatus.CurrentActiveReaders).
+			Uint("Optimal", predictedOptimalSize).
 			Msg("Cluster size is optimal")
 	}
 
-	if desiredClusterSize > currentSize {
+	if predictedOptimalSize > clusterStatus.CurrentActiveReaders {
 		s.logger.Info().
-			Uint("Actual", currentSize).
-			Uint("Desired", desiredClusterSize).
-			Msg("Cluster size is below desired size, scaling out")
+			Uint("Actual", clusterStatus.CurrentActiveReaders).
+			Uint("Optimal", predictedOptimalSize).
+			Msg("Cluster size is below Optimal size, scaling out")
 
-		if s.scaleOutStatus.IsScaling {
+		if s.scalerStatus.IsScaling {
 			s.logger.Info().Msg("Skipping scale out: Scaling operation already in progress")
 			return
 		}
 
-		err := s.scaleOut(readerNamePrefix, desiredClusterSize-currentSize)
+		err := s.scaleOut(s.config.InstanceNamePrefix, predictedOptimalSize-clusterStatus.CurrentActiveReaders)
 		if err != nil {
 			return
 		}
 	}
 
-	if desiredClusterSize < currentSize {
+	if predictedOptimalSize < clusterStatus.CurrentActiveReaders {
 		s.logger.Info().
-			Uint("Actual", currentSize).
-			Uint("Desired", desiredClusterSize).
-			Msg("Cluster size is above desired size, scaling in")
+			Uint("Actual", clusterStatus.CurrentActiveReaders).
+			Uint("Optimal", predictedOptimalSize).
+			Msg("Cluster size is above Optimal size, scaling in")
 
-		if s.scaleInStatus.IsScaling {
+		if s.scalerStatus.IsScaling {
 			s.logger.Info().Msg("Skipping scale in: Scaling operation already in progress")
 			return
 		}
 
-		err := s.scaleIn(currentSize - desiredClusterSize)
+		err := s.scaleIn(clusterStatus.CurrentActiveReaders - predictedOptimalSize)
 		if err != nil {
 			s.logger.Error().Err(err).Msg("Error scaling in")
 		}
 	}
+}
+
+func (s *Scaler) GetClusterStatusHistory(duration time.Duration) []*types.ClusterStatus {
+	start := time.Now().In(time.UTC).Add(-1 * duration)
+	statusHistory, err := s.metrics.GetClusterStatus(start, time.Now().In(time.UTC), 5*time.Minute)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Error getting cluster status history")
+		return nil
+	}
+	return statusHistory
+}
+
+func (s *Scaler) GetClusterStatusPredictionHistory(duration time.Duration) []*types.ClusterStatus {
+	end := time.Now().In(time.UTC).Add(-7 * 24 * time.Hour).Add(s.config.PlanAheadTime)
+	start := end.Add(-1 * duration)
+	statusPrediction, err := s.metrics.GetClusterStatus(start, end, 5*time.Minute)
+
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Error getting cluster status prediction history")
+		return nil
+	}
+
+	for key, predictedStatus := range statusPrediction {
+		statusPrediction[key].Timestamp = predictedStatus.Timestamp.
+			Add(7 * 24 * time.Hour).         // Add 7 days to the timestamp to get the predicted time
+			Add(-1 * s.config.PlanAheadTime) // Shift time back by the PlanAheadTime
+	}
+	return statusPrediction
+}
+
+func (s *Scaler) getClusterStatus() (*types.ClusterStatus, error) {
+	var totalCPUUtilization float64
+	var clusterStatus = types.ClusterStatus{
+		Identifier: s.config.RdsClusterName,
+		Timestamp:  time.Now().In(time.UTC),
+	}
+
+	//writerInstance, err := s.getWriterInstance()
+	writerInstance, err := s.getWriterInstance()
+	if err != nil {
+		return nil, fmt.Errorf("didn't get writer instance: %v", err)
+	}
+
+	readerInstances, err := s.getReaderInstances(StatusAll)
+	if err != nil {
+		return nil, fmt.Errorf("didn't get reader instances: %v", err)
+	}
+
+	// Collect information about the writer readerInstance
+	writerUtilization, err := s.metrics.GetCurrentInstanceUtilization(writerInstance)
+	if err != nil {
+		return nil, fmt.Errorf("didn't get current CPU utilization: %v", err)
+	}
+
+	writerStatus := types.InstanceStatus{
+		Identifier:     *writerInstance.DBInstanceIdentifier,
+		IsWriter:       true,
+		Status:         *writerInstance.DBInstanceStatus,
+		CPUUtilization: writerUtilization,
+	}
+
+	s.logInstanceStatus(writerStatus)
+
+	totalCPUUtilization += writerStatus.CPUUtilization
+	clusterStatus.CurrentActiveReaders = 1
+	clusterStatus.Instances = append(clusterStatus.Instances, writerStatus)
+
+	// Collect information about reader instances
+	for _, readerInstance := range readerInstances {
+		readerUtilization, err := s.metrics.GetCurrentInstanceUtilization(readerInstance)
+		if err != nil {
+			return nil, err
+		}
+
+		readerStatus := types.InstanceStatus{
+			Identifier:     *readerInstance.DBInstanceIdentifier,
+			IsWriter:       false,
+			Status:         *readerInstance.DBInstanceStatus,
+			CPUUtilization: readerUtilization,
+		}
+
+		s.logInstanceStatus(readerStatus)
+
+		if readerStatus.Status == "available" {
+			clusterStatus.CurrentActiveReaders++
+			totalCPUUtilization += readerStatus.CPUUtilization
+		}
+		clusterStatus.Instances = append(clusterStatus.Instances, readerStatus)
+	}
+
+	clusterStatus.AverageCPUUtilization = totalCPUUtilization / float64(clusterStatus.CurrentActiveReaders)
+	clusterStatus.OptimalSize = s.metrics.CalculateOptimalClusterSize(clusterStatus.AverageCPUUtilization, clusterStatus.CurrentActiveReaders, s.config.MinInstances)
+
+	return &clusterStatus, nil
+}
+
+func (s *Scaler) logInstanceStatus(writerStatus types.InstanceStatus) {
+	s.logger.Info().
+		Str("Identifier", writerStatus.Identifier).
+		Bool("IsWriter", writerStatus.IsWriter).
+		Str("Status", writerStatus.Status).
+		Float64("CPUUtilization", writerStatus.CPUUtilization).
+		Msg("Instance status")
 }
 
 func (s *Scaler) logScalerStatus(cpuUtilization float64, currentSize int) {
@@ -159,54 +250,7 @@ func (s *Scaler) logScalerStatus(cpuUtilization float64, currentSize int) {
 		Msg("Scaler status")
 }
 
-func (s *Scaler) getUtilizationPrediction(instanceStatus []InstanceStatus) (*history.UtilizationSnapshot, error) {
-	historicQueryTime := time.Now().
-		Add(-time.Hour * 24 * 7).
-		Truncate(10 * time.Second)
-
-	prediction, err := s.dynamoDbHistory.GetValue(historicQueryTime, s.config.PlanAheadTime)
-	if prediction != nil {
-		s.submitBroadcast(&Broadcast{"prediction", prediction})
-	} else {
-		s.logger.Warn().Msg("No historic value found")
-	}
-
-	currentCpuUtilization, currentActiveReaderCount, err := s.getMaxCPUUtilization(instanceStatus)
-	if err != nil {
-		return nil, fmt.Errorf("error getting max CPU utilization: %v", err)
-	}
-
-	snapshot := history.UtilizationSnapshot{
-		Timestamp:         time.Now().Truncate(10 * time.Second),
-		ClusterName:       s.config.RdsClusterName,
-		NumReaders:        currentActiveReaderCount,
-		MaxCpuUtilization: currentCpuUtilization,
-		PredictedValue:    false,
-		TTL:               time.Now().Add(8 * 24 * time.Hour).Unix(),
-	}
-	s.submitBroadcast(&Broadcast{"snapshot", snapshot})
-
-	// Save the item to DynamoDB when scaling is required
-	if err = s.dynamoDbHistory.SaveItem(&snapshot); err != nil {
-		s.logger.Error().Err(err).Msg("Error saving item to DynamoDB")
-	}
-
-	s.logScalerStatus(prediction.MaxCpuUtilization, len(instanceStatus))
-
-	// If a historic value was found, use it to predict the current CPU utilization
-	if prediction != nil && prediction.MaxCpuUtilization > 0 {
-		// how high would the historic CPU utilization be with the current reader count?
-		s.logger.Info().
-			Float64("Historic 98 percentile", prediction.MaxCpuUtilization).
-			Float64("CurrentCPUUtilization", currentCpuUtilization).
-			Msg("Historic value found.")
-
-		return prediction, nil
-	}
-	return &snapshot, nil
-}
-
-func (s *Scaler) submitBroadcast(broadcast *Broadcast) {
+func (s *Scaler) submitBroadcast(broadcast *types.Broadcast) {
 	if broadcast.Data != nil {
 		go func() {
 			s.broadcast <- *broadcast
@@ -215,12 +259,9 @@ func (s *Scaler) submitBroadcast(broadcast *Broadcast) {
 }
 
 func (s *Scaler) scaleOut(readerNamePrefix string, numInstances uint) error {
-	s.scaleOutStatus.IsScaling = true
-	defer func() {
-		s.scaleOutStatus.IsScaling = false
-	}()
+	s.scalerStatus.IsScaling = true
 
-	currentHour := time.Now().Hour()
+	currentHour := time.Now().In(time.UTC).Hour()
 	newReaderInstanceNames := make([]string, numInstances)
 
 	for i := 0; i < int(numInstances); i++ {
@@ -228,6 +269,11 @@ func (s *Scaler) scaleOut(readerNamePrefix string, numInstances uint) error {
 		writerInstance, err := s.getWriterInstance()
 		if err != nil {
 			return fmt.Errorf("failed to get current writer instance: %v", err)
+		}
+
+		readerInstances, err := s.getReaderInstances(StatusAll ^ StatusDeleting)
+		if (len(readerInstances) + 1) >= int(s.config.MaxInstances) {
+			return fmt.Errorf("max number of instances reached")
 		}
 
 		// Generate a random UID for the new reader instance name
@@ -248,11 +294,13 @@ func (s *Scaler) scaleOut(readerNamePrefix string, numInstances uint) error {
 	}
 
 	go func() {
-		start := time.Now()
+		start := time.Now().In(time.UTC)
 		err := s.waitForInstancesAvailable(newReaderInstanceNames)
 		elapsed := time.Since(start)
 
-		s.scaleOutStatus.LastScale = time.Now()
+		s.scalerStatus.LastScale = time.Now().In(time.UTC)
+		s.scalerStatus.IsScaling = false
+
 		if err != nil {
 			s.logger.Error().Err(err).Msg("Error setting cooldown status")
 		}
@@ -273,14 +321,9 @@ func (s *Scaler) scaleOut(readerNamePrefix string, numInstances uint) error {
 }
 
 func (s *Scaler) scaleIn(numInstances uint) error {
-	s.scaleInStatus.IsScaling = true
+	s.scalerStatus.IsScaling = true
 
-	defer func() {
-		// Reset the isScaling flag
-		s.scaleInStatus.IsScaling = false
-	}()
-
-	readerInstances, _, err := s.getReaderInstances(StatusAll)
+	readerInstances, err := s.getReaderInstances(StatusAll)
 
 	if err != nil {
 		return fmt.Errorf("failed to get reader instances: %v", err)
@@ -294,22 +337,6 @@ func (s *Scaler) scaleIn(numInstances uint) error {
 
 		// Choose a reader instance to remove
 		instance := readerInstances[i]
-
-		// Check if the instance is in the process of deletion, and it's the last remaining reader instance
-		if *instance.DBInstanceStatus == "deleting" && len(readerInstances) == 1 {
-			s.logger.Info().Str("InstanceID", *instance.DBInstanceIdentifier).Msg("The last remaining instance is already in status 'deleting'. Will not remove it to avoid service disruption.")
-			break
-		}
-
-		// Skip over instances with the status "deleting"
-		if *instance.DBInstanceStatus == "deleting" {
-			s.logger.Info().Str("InstanceID", *instance.DBInstanceIdentifier).Msg("Skipping instance already in status 'deleting'")
-			err := s.waitUntilInstanceIsDeleted(*instance.DBInstanceIdentifier)
-			if err != nil {
-				return err
-			}
-			continue
-		}
 
 		// Wait for the instance to become deletable
 		err := s.waitUntilInstanceDeletable(*instance.DBInstanceIdentifier)
@@ -326,12 +353,21 @@ func (s *Scaler) scaleIn(numInstances uint) error {
 			return fmt.Errorf("failed to remove reader instance: %v", err)
 		}
 
-		err = s.waitUntilInstanceIsDeleted(*instance.DBInstanceIdentifier)
-		if err != nil {
-			return err
-		}
+		go func() {
+			err := s.waitUntilInstanceIsDeleted(*instance.DBInstanceIdentifier)
+			s.scalerStatus.IsScaling = false
+			if err != nil {
+				return
+			}
+		}()
+
 		s.logger.Info().Str("InstanceIdentifier", *instance.DBInstanceIdentifier).Str("InstanceStatus", *instance.DBInstanceStatus).Msg("Instance is deleting")
 	}
 
 	return nil
+}
+
+func (s *Scaler) Stop() {
+	s.logger.Info().Msg("Stopping scaler")
+	close(s.broadcast)
 }

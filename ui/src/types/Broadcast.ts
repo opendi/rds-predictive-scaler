@@ -1,8 +1,6 @@
-import Snapshot from "./Snapshot";
-
 interface Broadcast {
     type: string;
-    data: Snapshot|Snapshot[]|any
+    data: any
 }
 
 export default Broadcast;

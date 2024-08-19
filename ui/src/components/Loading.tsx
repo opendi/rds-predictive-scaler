@@ -11,7 +11,7 @@ const Loading: React.FC<LoadingProps> = ({ readyState }) => {
             case ReadyState.CONNECTING:
                 return "Connecting to service...";
             case ReadyState.OPEN:
-                return "WebSocket connection is open.";
+                return "WebSocket connection is open. Loading...";
             case ReadyState.CLOSING:
                 return "WebSocket connection is closing. Reconnecting...";
             case ReadyState.CLOSED:

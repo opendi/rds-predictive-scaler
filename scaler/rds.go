@@ -99,7 +99,7 @@ func (s *Scaler) createReaderInstance(readerName string, writerInstance *rds.DBI
 	return s.rdsClient.CreateDBInstance(readerDBInstance)
 }
 
-func (s *Scaler) getReaderInstances(statusFilter uint64) ([]*rds.DBInstance, uint, error) {
+func (s *Scaler) getReaderInstances(statusFilter uint64) ([]*rds.DBInstance, error) {
 	describeInput := &rds.DescribeDBInstancesInput{
 		Filters: []*rds.Filter{
 			{
@@ -111,12 +111,12 @@ func (s *Scaler) getReaderInstances(statusFilter uint64) ([]*rds.DBInstance, uin
 
 	describeOutput, err := s.rdsClient.DescribeDBInstances(describeInput)
 	if err != nil {
-		return nil, 0, fmt.Errorf("error describing RDS instances: %v", err)
+		return nil, fmt.Errorf("error describing RDS instances: %v", err)
 	}
 
 	writerInstance, err := s.getWriterInstance()
 	if err != nil {
-		return nil, 0, fmt.Errorf("error describing RDS writer instance: %v", err)
+		return nil, fmt.Errorf("error describing RDS writer instance: %v", err)
 	}
 
 	readerInstances := make([]*rds.DBInstance, 0)
@@ -129,7 +129,7 @@ func (s *Scaler) getReaderInstances(statusFilter uint64) ([]*rds.DBInstance, uin
 		}
 	}
 	// reader instances, counting writer in
-	return readerInstances, uint(len(readerInstances)) + 1, nil
+	return readerInstances, nil
 }
 
 func (s *Scaler) waitForInstancesAvailable(instanceIdentifiers []string) error {
@@ -210,7 +210,11 @@ func (s *Scaler) waitUntilInstanceIsDeleted(instanceIdentifier string) error {
 
 		instanceStatus := *describeOutput.DBInstances[0].DBInstanceStatus
 
-		s.logger.Info().Str("InstanceIdentifier", instanceIdentifier).Str("InstanceStatus", instanceStatus).Msg("Waiting for instance to be deleted")
+		s.logger.Info().
+			Str("InstanceIdentifier", instanceIdentifier).
+			Str("InstanceStatus", instanceStatus).
+			Msg("Waiting for instance to be deleted")
+
 		time.Sleep(5 * time.Second)
 	}
 }

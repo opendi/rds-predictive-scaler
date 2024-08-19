@@ -1,10 +1,11 @@
-export interface Config {
-    MaxInstances: number;
-    MinInstances: number;
-    TargetCpuUtil: number;
-    PlanAheadTime: number;
-    ScaleOutCooldown: number;
-    ScaleInCooldown: number;
-    ScaleInStep: number;
-    ScaleOutStep: number;
+interface Config {
+    aws_region: string;
+    rds_cluster_name: string;
+    instance_name_prefix: string;
+    max_instances: number;
+    min_instances: number;
+    boost_hours: string;
+    target_cpu_util: number;
+    plan_ahead_time: number;
+    server_port: number;
 }

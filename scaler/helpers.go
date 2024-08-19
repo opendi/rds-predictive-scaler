@@ -4,16 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 )
-
-// Helper function to return the minimum of two integers
-func minInt(a, b uint) uint {
-	if a < b {
-		return a
-	}
-	return b
-}
 
 func containsString(list []string, str string) bool {
 	for _, s := range list {
@@ -56,12 +47,4 @@ func parseBoostHours(scaleOutHoursStr string) ([]int, error) {
 		scaleOutHours = append(scaleOutHours, hour)
 	}
 	return scaleOutHours, nil
-}
-
-func calculateRemainingCooldown(cooldown time.Duration, lastScaleTime time.Time) time.Duration {
-	remainingCooldown := cooldown - time.Since(lastScaleTime)
-	if remainingCooldown > 0 {
-		return remainingCooldown
-	}
-	return 0
 }
